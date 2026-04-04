@@ -3,6 +3,7 @@
 venv_gtk/
 venv_gtk_release/
 venv_release_win/
+.helloagents/
 experiments/
 build/
 dist/
@@ -11,8 +12,12 @@ dist/
 build_flatpak/
 build_gtk/
 build_gtk_release/
+native/ncnn_vulkan_runtime/build/
 torch_compile_debug/
 __pycache__/
+resources/
+*.fp16_ncnn_model/
+*.fp32_ncnn_model/
 *.egg-info/
 *.pth
 *.pt
@@ -20,3 +25,4 @@ __pycache__/
 *.pyc
 *.mo
 *.ep
+*.lada_vulkan.param

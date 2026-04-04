@@ -67,6 +67,18 @@ def get_mask_area(mask: Mask) -> float:
 def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
+def _create_blend_mask_cpu(mask: torch.Tensor, blur_size: int, pad_top: int, pad_bottom: int, pad_left: int, pad_right: int) -> torch.Tensor:
+    mask_np = (mask.numpy() > 0).astype(np.float32)
+    blend = np.pad(
+        np.ones((mask.shape[0] - pad_top - pad_bottom, mask.shape[1] - pad_left - pad_right), dtype=np.float32),
+        ((pad_top, pad_bottom), (pad_left, pad_right)),
+        mode='constant',
+        constant_values=0.0,
+    )
+    blend = np.maximum(mask_np, blend)
+    blend = cv2.blur(blend, (blur_size, blur_size), borderType=cv2.BORDER_REFLECT)
+    return torch.from_numpy(blend).to(dtype=mask.dtype)
+
 def create_blend_mask(crop_mask: torch.Tensor):
     mask = crop_mask.squeeze()
     h, w = mask.shape
@@ -84,8 +96,12 @@ def create_blend_mask(crop_mask: torch.Tensor):
     pad_bottom = h_outer - pad_top
     pad_left = w_outer // 2
     pad_right = w_outer - pad_left
-    blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
     mask4 = (mask > 0)
+    if mask.device.type == 'cpu':
+        blend = _create_blend_mask_cpu(mask, blur_size, pad_top, pad_bottom, pad_left, pad_right)
+        assert blend.shape == mask.shape
+        return blend
+    blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
     blend = torch.maximum(mask4, blend)
     kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
     blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)

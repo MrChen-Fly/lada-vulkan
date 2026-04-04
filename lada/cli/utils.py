@@ -9,11 +9,11 @@ import subprocess
 import sys
 import time
 
-import torch
 from tqdm import tqdm
 from wcwidth import wcswidth
 
 from lada import ModelFiles
+from lada.compute_targets import get_compute_targets
 from lada.utils import VideoMetadata, video_utils
 
 COL_SEP = "  "
@@ -108,31 +108,12 @@ def dump_encoders():
     _dump_table(table)
 
 def dump_torch_devices():
-    from lada.utils.os_utils import has_mps
-
     print(_("Available devices:"))
-    devices = ["cpu"]
-    descriptions = ["CPU"]
-
-    if torch.cuda.is_available():
-        cuda_device_count = torch.cuda.device_count()
-        for i in range(cuda_device_count):
-            devices.append(f"cuda:{i}")
-            descriptions.append(torch.cuda.get_device_properties(i).name)
-
-    if has_mps():
-        devices.append("mps")
-        descriptions.append("Apple MPS (Metal)")
-
-    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-        xpu_device_count = torch.xpu.device_count()
-        for i in range(xpu_device_count):
-            devices.append(f"xpu:{i}")
-            descriptions.append(torch.xpu.get_device_name(i))
-
-    table = [[_("Device"), _("Description")]]
-    for device, description in zip(devices, descriptions):
-        table.append([device, description])
+    table = [[_("Device"), _("Description"), _("Status"), _("Notes")]]
+    for target in get_compute_targets(include_experimental=True):
+        status = _("Available") if target.available else _("Unavailable")
+        notes = target.notes if target.notes else (_("Experimental") if target.experimental else "")
+        table.append([target.id, target.description, status, notes])
     _dump_table(table)
 
 def dump_available_detection_models():

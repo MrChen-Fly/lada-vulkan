@@ -53,15 +53,23 @@ class PipelineQueue(Queue):
 
     def put(self, item, block=True, timeout=None):
         self.stats[f"{self.name}_max_size"] = max(self.qsize() + 1, self.stats[f"{self.name}_max_size"])
-        s = time.time()
+        s = time.perf_counter()
         super().put(item, block=block, timeout=timeout)
-        self.stats[f"{self.name}_wait_time_put"] += time.time() - s
+        self.stats[f"{self.name}_wait_time_put"] += time.perf_counter() - s
 
     def get(self, block=True, timeout=None):
-        s = time.time()
+        s = time.perf_counter()
         item = super().get(block=block, timeout=timeout)
-        self.stats[f"{self.name}_wait_time_get"] += time.time() - s
+        self.stats[f"{self.name}_wait_time_get"] += time.perf_counter() - s
         return item
+
+    def snapshot_stats(self) -> dict[str, float | int]:
+        return {
+            "wait_time_put_s": float(self.stats[f"{self.name}_wait_time_put"]),
+            "wait_time_get_s": float(self.stats[f"{self.name}_wait_time_get"]),
+            "max_size": int(self.stats[f"{self.name}_max_size"]),
+            "configured_maxsize": int(self.maxsize),
+        }
 
 def put_queue_stop_marker(queue: Queue | PipelineQueue, debug_queue_name: str | None = None, stop_marker=STOP_MARKER):
     queue_name = queue.name if isinstance(queue, PipelineQueue) else debug_queue_name

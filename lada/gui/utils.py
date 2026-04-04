@@ -7,11 +7,11 @@ import subprocess
 import xml.etree.ElementTree as ET
 from typing import Callable
 
-import torch
 from gi.repository import Gio
 from gi.repository import Gtk, GLib, Gdk
 
 from lada import LOG_LEVEL
+from lada.compute_targets import get_compute_targets, is_compute_target_available, normalize_compute_target_id
 from lada.gui.config.config import Config
 from lada.utils import video_utils
 from lada.utils.video_utils import EncodingPreset
@@ -20,17 +20,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
 
 def is_device_available(device: str) -> bool:
-    device = device.lower()
-    if device == 'cpu':
-        return True
-    elif device.startswith("cuda:"):
-        return torch.cuda.is_available() and device_to_gpu_id(device) < torch.cuda.device_count()
-    elif device.startswith("xpu:"):
-        return hasattr(torch, 'xpu') and torch.xpu.is_available() and device_to_gpu_id(device) < torch.xpu.device_count()
-    elif device == 'mps':
-        from lada.utils.os_utils import has_mps
-        return has_mps()
-    return False
+    return is_compute_target_available(normalize_compute_target_id(device))
 
 
 def device_to_gpu_id(device) -> int | None:
@@ -41,28 +31,14 @@ def device_to_gpu_id(device) -> int | None:
 
 
 def get_available_gpus() -> list[tuple[str, str]]:
-    from lada.utils.os_utils import has_mps
-
     gpus = []
-
-    if torch.cuda.is_available():
-        cuda_device_count = torch.cuda.device_count()
-        for i in range(cuda_device_count):
-            gpu_name = torch.cuda.get_device_name(i)
-            # We're using these GPU names in a ComboBox but libadwaita sets up the label with max-width-chars: 20 and there does not
-            # seem to be a way to overwrite this. So let's try to make sure GPU names are below 20 characters to be readable
-            if gpu_name.startswith("NVIDIA GeForce RTX"):
-                gpu_name = gpu_name.replace("NVIDIA GeForce RTX", "RTX")
-            gpus.append((f"cuda:{i}", gpu_name))
-
-    if has_mps():
-        gpus.append(("mps", "Apple MPS (Metal)"))
-
-    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-        xpu_device_count = torch.xpu.device_count()
-        for i in range(xpu_device_count):
-            gpu_name = torch.xpu.get_device_name(i)
-            gpus.append((f"xpu:{i}", gpu_name))
+    for target in get_compute_targets(include_experimental=True):
+        if target.id == "cpu" or not target.available:
+            continue
+        gpu_name = target.description
+        if gpu_name.startswith("NVIDIA GeForce RTX"):
+            gpu_name = gpu_name.replace("NVIDIA GeForce RTX", "RTX")
+        gpus.append((target.id, gpu_name))
     return gpus
 
 def skip_if_uninitialized(f):

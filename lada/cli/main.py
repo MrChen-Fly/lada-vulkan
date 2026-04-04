@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import argparse
+import json
 import os
 import pathlib
 import sys
 import tempfile
 import textwrap
+from time import perf_counter
 
 # When frozen (PyInstaller) on macOS, multiprocessing spawn re-executes this
 # executable with -B -S -I -c "from multiprocessing.resource_tracker import main; main(...)".
@@ -24,6 +26,8 @@ if getattr(sys, "frozen", False) and sys.platform == "darwin":
         if sys.argv[i] == "-c":
             break
 
+_CLI_PROCESS_START = perf_counter()
+
 try:
     import torch
 except ModuleNotFoundError:
@@ -37,12 +41,53 @@ except ModuleNotFoundError:
 
 from lada import VERSION, ModelFiles
 from lada.cli import utils
+from lada.compute_targets import (
+    describe_compute_target_issue,
+    get_compute_target,
+    get_default_compute_target,
+    normalize_compute_target_id,
+    resolve_torch_device,
+)
 from lada.utils import audio_utils, video_utils
-from lada.utils.os_utils import gpu_has_fp16_acceleration, get_default_torch_device
+from lada.utils.os_utils import gpu_has_fp16_acceleration
 from lada.restorationpipeline.frame_restorer import FrameRestorer
 from lada.restorationpipeline import load_models
+from lada.restorationpipeline.runtime_profiling import WallClockProfiler
 from lada.utils.threading_utils import STOP_MARKER, ErrorMarker
 from lada.utils.video_utils import get_video_meta_data, VideoWriter, get_default_preset_name
+
+
+def _video_metadata_to_report(video_metadata) -> dict[str, object]:
+    return {
+        "video_file": video_metadata.video_file,
+        "video_width": video_metadata.video_width,
+        "video_height": video_metadata.video_height,
+        "video_fps": float(video_metadata.video_fps),
+        "video_fps_exact": str(video_metadata.video_fps_exact),
+        "frames_count": video_metadata.frames_count,
+        "duration": float(video_metadata.duration),
+        "time_base": str(video_metadata.time_base),
+        "start_pts": video_metadata.start_pts,
+        "codec_name": video_metadata.codec_name,
+    }
+
+
+def _compute_target_to_report(compute_target) -> dict[str, object]:
+    return {
+        "id": compute_target.id,
+        "description": compute_target.description,
+        "runtime": compute_target.runtime,
+        "available": compute_target.available,
+        "torch_device": compute_target.torch_device,
+        "notes": compute_target.notes,
+        "experimental": compute_target.experimental,
+    }
+
+
+def _write_timing_report(report_path: str, report: dict[str, object]) -> None:
+    pathlib.Path(report_path).parent.mkdir(exist_ok=True, parents=True)
+    with open(report_path, "w", encoding="utf-8") as file_obj:
+        json.dump(report, file_obj, indent=2, ensure_ascii=False)
 
 def setup_argparser() -> argparse.ArgumentParser:
     examples_header_text = _("Examples:")
@@ -81,8 +126,9 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_general.add_argument('--output', type=str, help=_('Path used to save output file(s). If path is a directory then file name will be chosen automatically (see --output-file-pattern). If no output path was given then the directory of the input file will be used'))
     group_general.add_argument('--temporary-directory', type=str, default=tempfile.gettempdir(), help=_('Directory for temporary video files during restoration process. Alternatively, you can use the environment variable TMPDIR. (default: %(default)s)'))
     group_general.add_argument('--output-file-pattern', type=str, default="{orig_file_name}.restored.mp4", help=_("Pattern used to determine output file name(s). Used when input is a directory, or a file but no output path was specified. Must include the placeholder '{orig_file_name}'. (default: %(default)s)"))
-    group_general.add_argument('--device', type=str, default=get_default_torch_device(), help=_('Device used for running Restoration and Detection models. Use "--list-devices" to see what\'s available (default: %(default)s)'))
+    group_general.add_argument('--device', type=str, default=get_default_compute_target(), help=_('Device used for running Restoration and Detection models. Use "--list-devices" to see what\'s available (default: %(default)s)'))
     group_general.add_argument('--fp16', action=argparse.BooleanOptionalAction, default=gpu_has_fp16_acceleration(), help=_("Reduces VRAM usage and may increase speed on modern GPUs, with negligible quality difference. (default: %(default)s)"))
+    group_general.add_argument('--timing-report-path', type=str, default=None, help=_('Optional path used to write a JSON timing report for the full CLI pipeline'))
     group_general.add_argument('--list-devices', action='store_true', help=_("List available devices and exit"))
     group_general.add_argument('--version', action='store_true', help=_("Display version and exit"))
     group_general.add_argument('--help', action='store_true', help=_("Show this help message and exit"))
@@ -111,28 +157,50 @@ def setup_argparser() -> argparse.ArgumentParser:
 
 def process_video_file(input_path: str, output_path: str, temp_dir_path: str, device: torch.device, mosaic_restoration_model, mosaic_detection_model,
                        mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start):
-    video_metadata = get_video_meta_data(input_path)
+    profiler = WallClockProfiler()
+    started_at = perf_counter()
+    with profiler.measure("video_metadata_probe_s"):
+        video_metadata = get_video_meta_data(input_path)
 
-    frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
-                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
+    with profiler.measure("frame_restorer_init_s"):
+        frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
+                     mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
     success = True
+    frames_written = 0
+    audio_profile: dict[str, object] = {}
+    frame_restorer_profile: dict[str, object] = {}
+    video_writer: VideoWriter | None = None
     video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
     frame_restorer_progressbar = utils.Progressbar(video_metadata)
     try:
-        frame_restorer.start()
+        with profiler.measure("frame_restorer_start_s"):
+            frame_restorer.start()
         frame_restorer_progressbar.init()
-        with VideoWriter(video_tmp_file_output_path, video_metadata.video_width, video_metadata.video_height,
-                         video_metadata.video_fps_exact, encoder=encoder, encoder_options=encoder_options,
-                         time_base=video_metadata.time_base, mp4_fast_start=mp4_fast_start) as video_writer:
-            for elem in frame_restorer:
+        with profiler.measure("video_writer_open_s"):
+            video_writer = VideoWriter(video_tmp_file_output_path, video_metadata.video_width, video_metadata.video_height,
+                                       video_metadata.video_fps_exact, encoder=encoder, encoder_options=encoder_options,
+                                       time_base=video_metadata.time_base, mp4_fast_start=mp4_fast_start)
+        with profiler.measure("restore_write_loop_s"):
+            frame_restorer_iterator = iter(frame_restorer)
+            while True:
+                with profiler.measure("frame_restorer_next_s"):
+                    try:
+                        elem = next(frame_restorer_iterator)
+                    except StopIteration:
+                        break
                 if elem is STOP_MARKER or isinstance(elem, ErrorMarker):
                     success = False
                     frame_restorer_progressbar.error = True
-                    print("Error on export: frame restorer stopped prematurely")
-                    break
+                    if isinstance(elem, ErrorMarker):
+                        raise RuntimeError(
+                            f"Frame restoration pipeline failed: {elem}\n{elem.stack_trace}"
+                        )
+                    raise RuntimeError("Frame restoration pipeline stopped prematurely.")
                 (restored_frame, restored_frame_pts) = elem
-                video_writer.write(restored_frame, restored_frame_pts, bgr2rgb=True)
+                with profiler.measure("video_writer_write_s"):
+                    video_writer.write(restored_frame, restored_frame_pts, bgr2rgb=True)
+                frames_written += 1
                 frame_restorer_progressbar.update()
     except (Exception, KeyboardInterrupt) as e:
         success = False
@@ -141,19 +209,50 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
         else:
             print("Error on export", e)
     finally:
-        frame_restorer.stop()
+        if video_writer is not None:
+            try:
+                with profiler.measure("video_writer_release_s"):
+                    video_writer.release()
+            except Exception as e:
+                success = False
+                print("Error on export", e)
+        with profiler.measure("frame_restorer_stop_s"):
+            frame_restorer.stop()
+        frame_restorer_profile = frame_restorer.get_last_profile()
         frame_restorer_progressbar.close(ensure_completed_bar=success)
 
     if success:
         print(_("Processing audio"))
-        audio_utils.combine_audio_video_files(video_metadata, video_tmp_file_output_path, output_path)
+        with profiler.measure("audio_mux_total_s"):
+            audio_profile = audio_utils.combine_audio_video_files(video_metadata, video_tmp_file_output_path, output_path)
     else:
         if os.path.exists(video_tmp_file_output_path):
             os.remove(video_tmp_file_output_path)
 
+    report: dict[str, object] = {
+        "input_path": input_path,
+        "output_path": output_path,
+        "success": success,
+        "frames_written": frames_written,
+        "video_metadata": _video_metadata_to_report(video_metadata),
+        "stages": profiler.snapshot(total_s=perf_counter() - started_at),
+        "frame_restorer": frame_restorer_profile,
+        "audio_mux": audio_profile,
+        "output_exists": os.path.exists(output_path),
+    }
+    if os.path.exists(output_path):
+        report["output_size_bytes"] = os.path.getsize(output_path)
+    return report
+
 def main():
-    argparser = setup_argparser()
-    args = argparser.parse_args()
+    command_profiler = WallClockProfiler()
+    command_profiler.add_duration("cli_bootstrap_import_s", perf_counter() - _CLI_PROCESS_START)
+
+    with command_profiler.measure("cli_setup_argparser_s"):
+        argparser = setup_argparser()
+    with command_profiler.measure("cli_parse_args_s"):
+        args = argparser.parse_args()
+
     if args.version:
         print("Lada: ", VERSION)
         sys.exit(0)
@@ -178,87 +277,143 @@ def main():
     if args.help or not args.input:
         argparser.print_help()
         sys.exit(0)
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        print(_("GPU {device} selected but CUDA is not available").format(device=args.device))
+
+    with command_profiler.measure("cli_compute_target_resolution_s"):
+        args.device = normalize_compute_target_id(args.device)
+        compute_target = get_compute_target(args.device, include_experimental=True)
+    if compute_target is None:
+        print(_("Unknown compute target '{target}'. Use \"--list-devices\" to inspect supported targets.").format(target=args.device))
         sys.exit(1)
-    if args.device == "mps":
-        from lada.utils.os_utils import has_mps
-        if not has_mps():
-            print(_("MPS selected but MPS (Metal) is not available"))
+    if compute_target_issue := describe_compute_target_issue(args.device):
+        print(compute_target_issue)
+        sys.exit(1)
+
+    with command_profiler.measure("cli_argument_validation_s"):
+        if "{orig_file_name}" not in args.output_file_pattern or "." not in args.output_file_pattern:
+            print(_("Invalid file name pattern. It must include the template string '{orig_file_name}' and a file extension"))
             sys.exit(1)
-    if "{orig_file_name}" not in args.output_file_pattern or "." not in args.output_file_pattern:
-        print(_("Invalid file name pattern. It must include the template string '{orig_file_name}' and a file extension"))
-        sys.exit(1)
-    if os.path.isdir(args.input) and args.output is not None and os.path.isfile(args.output):
-        print(_("Invalid output directory. If input is a directory then --output must also be set to a directory"))
-        sys.exit(1)
-    if not (os.path.isfile(args.input) or os.path.isdir(args.input)):
-        print(_("Invalid input. No file or directory at {input_path}").format(input_path=args.input))
-        sys.exit(1)
-    if args.temporary_directory and not os.path.isdir(args.temporary_directory):
-        print(_("Temporary directory {temporary_path} doesn't exist. Creating…").format(temporary_path=args.temporary_directory))
-        os.makedirs(args.temporary_directory)
-
-    if detection_modelfile := ModelFiles.get_detection_model_by_name(args.mosaic_detection_model):
-        mosaic_detection_model_path = detection_modelfile.path
-    elif os.path.isfile(args.mosaic_detection_model):
-        mosaic_detection_model_path = args.mosaic_detection_model
-    else:
-        print(_("Invalid mosaic detection model"))
-        sys.exit(1)
-
-    if restoration_modelfile := ModelFiles.get_restoration_model_by_name(args.mosaic_restoration_model):
-        mosaic_restoration_model_name = args.mosaic_restoration_model
-        mosaic_restoration_model_path = restoration_modelfile.path
-    elif os.path.isfile(args.mosaic_restoration_model):
-        mosaic_restoration_model_path = args.mosaic_restoration_model
-        mosaic_restoration_model_name = 'basicvsrpp' # Assume custom model is basicvsrpp. DeepMosaics custom path is not supported
-    else:
-        print(_("Invalid mosaic restoration model"))
-        sys.exit(1)
-
-    encoder = None
-    encoder_options = None
-    if args.encoder:
-        encoder = args.encoder
-        encoder_options = args.encoder_options if args.encoder_options else ''
-    elif args.encoding_preset:
-        encoding_presets = video_utils.get_encoding_presets()
-        found = False
-        for preset in encoding_presets:
-            if preset.name == args.encoding_preset:
-                found = True
-                encoder = preset.encoder_name
-                encoder_options = preset.encoder_options
-                break
-        if not found:
-            print(_("Invalid encoding preset"))
+        if os.path.isdir(args.input) and args.output is not None and os.path.isfile(args.output):
+            print(_("Invalid output directory. If input is a directory then --output must also be set to a directory"))
             sys.exit(1)
-    else:
-        print(_('Either "--encoding-preset" or "--encoder" together with "--encoder-options" must be used'))
-        sys.exit(1)
+        if not (os.path.isfile(args.input) or os.path.isdir(args.input)):
+            print(_("Invalid input. No file or directory at {input_path}").format(input_path=args.input))
+            sys.exit(1)
+        if args.temporary_directory and not os.path.isdir(args.temporary_directory):
+            print(_("Temporary directory {temporary_path} doesn't exist. Creating...").format(temporary_path=args.temporary_directory))
+            os.makedirs(args.temporary_directory)
+
+    with command_profiler.measure("cli_model_path_resolution_s"):
+        if detection_modelfile := ModelFiles.get_detection_model_by_name(args.mosaic_detection_model):
+            mosaic_detection_model_path = detection_modelfile.path
+        elif os.path.isfile(args.mosaic_detection_model):
+            mosaic_detection_model_path = args.mosaic_detection_model
+        else:
+            print(_("Invalid mosaic detection model"))
+            sys.exit(1)
+
+        if restoration_modelfile := ModelFiles.get_restoration_model_by_name(args.mosaic_restoration_model):
+            mosaic_restoration_model_name = args.mosaic_restoration_model
+            mosaic_restoration_model_path = restoration_modelfile.path
+        elif os.path.isfile(args.mosaic_restoration_model):
+            mosaic_restoration_model_path = args.mosaic_restoration_model
+            mosaic_restoration_model_name = 'basicvsrpp' # Assume custom model is basicvsrpp. DeepMosaics custom path is not supported
+        else:
+            print(_("Invalid mosaic restoration model"))
+            sys.exit(1)
+
+    with command_profiler.measure("cli_encoder_resolution_s"):
+        encoder = None
+        encoder_options = None
+        if args.encoder:
+            encoder = args.encoder
+            encoder_options = args.encoder_options if args.encoder_options else ''
+        elif args.encoding_preset:
+            encoding_presets = video_utils.get_encoding_presets()
+            found = False
+            for preset in encoding_presets:
+                if preset.name == args.encoding_preset:
+                    found = True
+                    encoder = preset.encoder_name
+                    encoder_options = preset.encoder_options
+                    break
+            if not found:
+                print(_("Invalid encoding preset"))
+                sys.exit(1)
+        else:
+            print(_('Either "--encoding-preset" or "--encoder" together with "--encoder-options" must be used'))
+            sys.exit(1)
     assert encoder is not None and encoder_options is not None
 
-    device = torch.device(args.device)
-    mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode = load_models(
-        device, mosaic_restoration_model_name, mosaic_restoration_model_path, args.mosaic_restoration_config_path,
-        mosaic_detection_model_path, args.fp16, args.detect_face_mosaics
-    )
+    with command_profiler.measure("cli_torch_device_resolution_s"):
+        device = (
+            resolve_torch_device(args.device)
+            if compute_target.torch_device is not None
+            else torch.device("cpu")
+        )
+    with command_profiler.measure("cli_model_load_s"):
+        loaded_models = load_models(
+            args.device, compute_target.torch_device and torch.device(compute_target.torch_device), mosaic_restoration_model_name, mosaic_restoration_model_path, args.mosaic_restoration_config_path,
+            mosaic_detection_model_path, args.fp16, args.detect_face_mosaics
+        )
+        mosaic_detection_model = loaded_models.detection_model
+        mosaic_restoration_model = loaded_models.restoration_model
+        preferred_pad_mode = loaded_models.preferred_pad_mode
 
-    input_files, output_files = utils.setup_input_and_output_paths(args.input, args.output, args.output_file_pattern)
+    with command_profiler.measure("cli_input_output_setup_s"):
+        input_files, output_files = utils.setup_input_and_output_paths(args.input, args.output, args.output_file_pattern)
 
     single_file_input = len(input_files) == 1
+    file_reports: list[dict[str, object]] = []
 
-    for input_path, output_path in zip(input_files, output_files):
-        if not single_file_input:
-            print(f"{os.path.basename(input_path)}:")
-        try:
-            process_video_file(input_path=input_path, output_path=output_path, temp_dir_path=args.temporary_directory, device=device, mosaic_restoration_model=mosaic_restoration_model, mosaic_detection_model=mosaic_detection_model,
-                               mosaic_restoration_model_name=mosaic_restoration_model_name, preferred_pad_mode=preferred_pad_mode, max_clip_length=args.max_clip_length,
-                               encoder=encoder, encoder_options=encoder_options, mp4_fast_start=args.mp4_fast_start)
-        except KeyboardInterrupt:
-            print(_("Received Ctrl-C, stopping restoration."))
-            break
+    with command_profiler.measure("cli_process_inputs_s"):
+        for input_path, output_path in zip(input_files, output_files):
+            if not single_file_input:
+                print(f"{os.path.basename(input_path)}:")
+            try:
+                file_reports.append(
+                    process_video_file(
+                        input_path=input_path,
+                        output_path=output_path,
+                        temp_dir_path=args.temporary_directory,
+                        device=device,
+                        mosaic_restoration_model=mosaic_restoration_model,
+                        mosaic_detection_model=mosaic_detection_model,
+                        mosaic_restoration_model_name=mosaic_restoration_model_name,
+                        preferred_pad_mode=preferred_pad_mode,
+                        max_clip_length=args.max_clip_length,
+                        encoder=encoder,
+                        encoder_options=encoder_options,
+                        mp4_fast_start=args.mp4_fast_start,
+                    )
+                )
+            except KeyboardInterrupt:
+                print(_("Received Ctrl-C, stopping restoration."))
+                break
+
+    command_total_s = perf_counter() - _CLI_PROCESS_START
+    command_report = {
+        "argv": list(sys.argv),
+        "command_total_s": command_total_s,
+        "timings": command_profiler.snapshot(total_s=command_total_s),
+        "compute_target": _compute_target_to_report(compute_target),
+        "device": str(device),
+        "encoder": {
+            "name": encoder,
+            "options": encoder_options,
+            "mp4_fast_start": args.mp4_fast_start,
+        },
+        "inputs": {
+            "input_root": args.input,
+            "output_root": args.output,
+            "temporary_directory": args.temporary_directory,
+            "single_file_input": single_file_input,
+        },
+        "files": file_reports,
+    }
+
+    if args.timing_report_path:
+        _write_timing_report(args.timing_report_path, command_report)
+        print(_("Timing report written to {path}").format(path=args.timing_report_path))
 
 if __name__ == '__main__':
     main()

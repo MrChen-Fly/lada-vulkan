@@ -6,14 +6,16 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import cache
-from typing import Callable, Iterator, Tuple, Literal
+from typing import Any, Callable, Iterator, Tuple, Literal
 from collections import deque
 import heapq
 import shlex
@@ -94,7 +96,7 @@ class VideoReader:
     def __exit__(self, exc_type, exc_value, traceback):
         self.container.close()
 
-    def frames(self) -> Iterator[Tuple[torch.Tensor, int]]:
+    def frames(self, output_format: Literal["torch", "numpy"] = "torch") -> Iterator[Tuple[torch.Tensor | np.ndarray, int]]:
         # Print to console via FFmpegs log callback instead of utilizing Pythons logging system
         # Unfortunately we need this to prevent deadlocks. On certain corrupt video files decode() would hang indefinitely after
         # encountering an error (always reproducible). See https://github.com/PyAV-Org/PyAV/issues/751 and https://codeberg.org/ladaapp/lada/issues/247
@@ -108,6 +110,15 @@ class VideoReader:
         last_good_frame = None
         consecutive_errors = 0
         max_consecutive_errors = 10  # Prevent infinite loops on completely corrupted streams
+
+        if output_format not in {"torch", "numpy"}:
+            raise ValueError(f"Unsupported VideoReader output format '{output_format}'.")
+
+        def _convert_frame(frame_array: np.ndarray) -> torch.Tensor | np.ndarray:
+            frame_array = np.ascontiguousarray(frame_array)
+            if output_format == "numpy":
+                return frame_array
+            return torch.from_numpy(frame_array)
         
         # Use packet-level decoding to handle corrupted frames properly
         vstream = self.container.streams.video[0]
@@ -116,10 +127,10 @@ class VideoReader:
                 frames = packet.decode()
                 for frame in frames:
                     nd_frame = frame.to_ndarray(format='bgr24')
-                    torch_frame = torch.from_numpy(nd_frame)
-                    last_good_frame = (torch_frame, frame.pts)
+                    output_frame = _convert_frame(nd_frame)
+                    last_good_frame = (output_frame, frame.pts)
                     consecutive_errors = 0
-                    yield torch_frame, frame.pts
+                    yield output_frame, frame.pts
             except av.error.InvalidDataError as e:
                 # Handle corrupted frames by duplicating the last good frame
                 if last_good_frame is not None and consecutive_errors < max_consecutive_errors:
@@ -289,6 +300,8 @@ def get_default_preset_name():
         return "hevc-apple-gpu-balanced"
     if os_utils.has_intel_arc_gpu() and is_intel_qsv_encoding_available():
         return "hevc-intel-gpu-hq"
+    if is_amd_amf_encoding_available():
+        return "hevc-amd-gpu-balanced"
     return "h264-cpu-fast"
 
 @cache
@@ -310,6 +323,9 @@ def get_encoding_presets() -> list[EncodingPreset]:
     has_apple_vt = False
     if 'hevc_videotoolbox' in available_encoder_names or 'h264_videotoolbox' in available_encoder_names:
         has_apple_vt = is_apple_videotoolbox_encoding_available()
+    has_amd_amf = False
+    if 'hevc_amf' in available_encoder_names or 'h264_amf' in available_encoder_names:
+        has_amd_amf = is_amd_amf_encoding_available()
 
     with open(encoding_presets_csv_path, mode='r', newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile, delimiter='|')
@@ -332,10 +348,30 @@ def get_encoding_presets() -> list[EncodingPreset]:
             is_apple_preset = 'videotoolbox' in encoder_name or 'apple' in preset_name
             if is_apple_preset and not has_apple_vt:
                 continue
+            # AMD AMF
+            is_amd_preset = 'amf' in encoder_name or 'amd' in preset_name
+            if is_amd_preset and not has_amd_amf:
+                continue
 
             preset = EncodingPreset(row["preset_name"], row["preset_description(translatable)"], False, row["encoder_name"], row["encoder_options"])    
             presets.append(preset)
         return presets
+
+
+def _can_encode_dummy_frame(codec_name: str, pix_fmt: str = 'yuv420p') -> bool:
+    try:
+        with av.logging.Capture():
+            mem_file = io.BytesIO()
+            with av.open(mem_file, mode='w', format='mp4') as container:
+                stream = container.add_stream(codec_name, rate=30)
+                stream.width = 64
+                stream.height = 64
+                stream.pix_fmt = pix_fmt
+                dummy_frame = av.VideoFrame(64, 64, format=pix_fmt)
+                stream.encode(dummy_frame)
+                return True
+    except Exception:
+        return False
 
 @cache
 def is_intel_qsv_encoding_available() -> bool:
@@ -347,19 +383,7 @@ def is_intel_qsv_encoding_available() -> bool:
         # It works when building PyAV locally against ffmpeg from ArchLinux on the same system
         # As a workaround let's encode a dummy frame to see if qsv is working
         # See issue: #297
-        try:
-            with av.logging.Capture():
-                mem_file = io.BytesIO()
-                with av.open(mem_file, mode='w', format='mp4') as container:
-                    stream = container.add_stream('h264_qsv', rate=30)
-                    stream.width = 64
-                    stream.height = 64
-                    stream.pix_fmt = 'nv12'
-                    dummy_frame = av.VideoFrame(64, 64, format='nv12')
-                    stream.encode(dummy_frame)
-                    return True
-        except Exception:
-            return False
+        return _can_encode_dummy_frame('h264_qsv', 'nv12')
 
 @cache
 def is_nvidia_cuda_encoding_available() -> bool:
@@ -372,19 +396,14 @@ def is_apple_videotoolbox_encoding_available() -> bool:
     if _is_codec_hardware_acceleration_working('hevc_videotoolbox', 'videotoolbox'):
         return True
     # HWAccel check can fail in frozen/PyInstaller builds. Try encoding a dummy frame instead (same approach as QSV on Linux).
-    try:
-        with av.logging.Capture():
-            mem_file = io.BytesIO()
-            with av.open(mem_file, mode='w', format='mp4') as container:
-                stream = container.add_stream('hevc_videotoolbox', rate=30)
-                stream.width = 64
-                stream.height = 64
-                stream.pix_fmt = 'yuv420p'
-                dummy_frame = av.VideoFrame(64, 64, format='yuv420p')
-                stream.encode(dummy_frame)
-                return True
-    except Exception:
-        return False
+    return _can_encode_dummy_frame('hevc_videotoolbox', 'yuv420p')
+
+
+@cache
+def is_amd_amf_encoding_available() -> bool:
+    if _is_codec_hardware_acceleration_working('h264_amf', 'amf'):
+        return True
+    return _can_encode_dummy_frame('h264_amf', 'yuv420p')
 
 def _is_codec_hardware_acceleration_working(codec_name: str, hwaccel_device_type: str, codec_mode: Literal["r", "w"]='w') -> bool:
     try:
@@ -398,6 +417,11 @@ def _is_codec_hardware_acceleration_working(codec_name: str, hwaccel_device_type
         return False
 
 class VideoWriter:
+    _STOP_MARKER = object()
+    _REORDER_BUFFER_MAX_SIZE = 30
+    _QUEUE_POLL_TIMEOUT_S = 0.1
+    _ENCODE_QUEUE_MEMORY_BUDGET_BYTES = 256 * 1024 * 1024
+
     def _parse_encoder_options(self, encoder_options: str):
         tokens = shlex.split(encoder_options)
         parsed_encoder_options = {
@@ -449,10 +473,26 @@ class VideoWriter:
         self.video_stream = video_stream_out
 
         # Buffers for reordering frames
-        self.BUFFER_MAX_SIZE = 30
+        self.BUFFER_MAX_SIZE = self._REORDER_BUFFER_MAX_SIZE
         self.pts_heap = []
         self.frame_queue = deque()
         self.pts_set = set()
+        frame_bytes = max(width * height * 3, 1)
+        self.encode_queue_max_size = max(
+            self.BUFFER_MAX_SIZE,
+            min(240, self._ENCODE_QUEUE_MEMORY_BUDGET_BYTES // frame_bytes),
+        )
+        self.encode_queue: queue.Queue[tuple[Any, int | None, str] | object] = queue.Queue(
+            maxsize=self.encode_queue_max_size
+        )
+        self.writer_exception: BaseException | None = None
+        self._release_started = False
+        self.writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="lada-video-writer",
+            daemon=True,
+        )
+        self.writer_thread.start()
 
     def __enter__(self):
         return self
@@ -460,19 +500,75 @@ class VideoWriter:
     def __exit__(self, exc_type, exc_value, traceback):
         self.release()
 
+    def _raise_if_writer_failed(self):
+        if self.writer_exception is not None:
+            raise RuntimeError("VideoWriter background encode thread failed.") from self.writer_exception
+
+    def _put_encode_request(self, item: tuple[Any, int | None, bool] | object):
+        while True:
+            self._raise_if_writer_failed()
+            try:
+                self.encode_queue.put(item, timeout=self._QUEUE_POLL_TIMEOUT_S)
+                return
+            except queue.Full:
+                continue
+
+    def _normalize_frame(self, frame: Any) -> np.ndarray:
+        if isinstance(frame, torch.Tensor):
+            frame = frame.cpu().numpy()
+        return np.ascontiguousarray(frame)
+
     def _process_buffer(self, flush_all=False):
         """Processes the buffer to encode frames."""
         if len(self.frame_queue) > (self.BUFFER_MAX_SIZE / 2) or (flush_all and self.frame_queue):
-            frame_to_encode = self.frame_queue.popleft()
+            frame_to_encode, pixel_format = self.frame_queue.popleft()
             pts_to_assign = heapq.heappop(self.pts_heap)
             self.pts_set.remove(pts_to_assign)
 
-            out_frame = av.VideoFrame.from_ndarray(frame_to_encode, format='rgb24')
+            out_frame = av.VideoFrame.from_ndarray(frame_to_encode, format=pixel_format)
             out_frame.pts = pts_to_assign
             out_packet = self.video_stream.encode(out_frame)
             if out_packet:
                 self.output_container.mux(out_packet)
 
+    def _handle_write_request(self, frame: Any, frame_pts: int | None, pixel_format: str):
+        frame = self._normalize_frame(frame)
+        if frame_pts not in self.pts_set:
+            heapq.heappush(self.pts_heap, frame_pts)
+            self.frame_queue.append((frame, pixel_format))
+            self.pts_set.add(frame_pts)
+        self._process_buffer()
+
+    def _flush_writer(self):
+        while len(self.frame_queue) > 0:
+            self._process_buffer(flush_all=True)
+        try:
+            out_packet = self.video_stream.encode(None)
+            if out_packet:
+                self.output_container.mux(out_packet)
+        except Exception:
+            # TODO: For half of my test files flushing QSV encoders fail here with
+            # "Application provided invalid, non monotonically increasing dts to muxer in stream".
+            # This doesn't happen with libx264 or NVENC encoders. The restored file plays fine
+            # so let's ignore it for now.
+            if self.is_qsv_encoder:
+                logger.warning("Error on flushing QSV encoder. Ignoring...")
+            else:
+                raise
+
+    def _writer_loop(self):
+        try:
+            while True:
+                item = self.encode_queue.get()
+                if item is self._STOP_MARKER:
+                    break
+                frame, frame_pts, pixel_format = item
+                self._handle_write_request(frame, frame_pts, pixel_format)
+            self._flush_writer()
+        except BaseException as exc:
+            self.writer_exception = exc
+        finally:
+            self.output_container.close()
 
     def write(self, frame, frame_pts=None, bgr2rgb=False):
         # We add the frame and its pts given by PyAV (FFmpeg) to a FIFO queue and a min heap, respectively.
@@ -483,34 +579,20 @@ class VideoWriter:
         # the user to identify a framerate ahead of time, and uses the timing of the existing PTS, but reorders the PTS.
         #
         # See https://codeberg.org/ladaapp/lada/pulls/33 for more information/discussion.
-        if isinstance(frame, torch.Tensor):
-            frame = frame.cpu().numpy()
-        if bgr2rgb:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        if frame_pts not in self.pts_set:
-            heapq.heappush(self.pts_heap, frame_pts)
-            self.frame_queue.append(frame)
-            self.pts_set.add(frame_pts)
-
-        self._process_buffer()
+        if self._release_started:
+            raise RuntimeError("VideoWriter.write() cannot be called after release().")
+        pixel_format = "bgr24" if bgr2rgb else "rgb24"
+        self._put_encode_request((frame, frame_pts, pixel_format))
 
     def release(self):
-        while len(self.frame_queue) > 0:
-            self._process_buffer(flush_all=True)
-        # Flush the encoder
-        try:
-            out_packet = self.video_stream.encode(None)
-            if out_packet:
-                self.output_container.mux(out_packet)
-        except:
-            # TODO: For half of my test files flushing QSV encoders fail here with "Application provided invalid, non monotonically increasing dts to muxer in stream"
-            # This doesn't happen with libx264 or NVENC encoders. The restored file plays fine so let's ignore it for now.
-            if self.is_qsv_encoder:
-                logger.warning("Error on flushing QSV encoder. Ignoring...")
-            else:
-                raise
-        self.output_container.close()
+        if self._release_started:
+            return
+        self._release_started = True
+        if self.writer_thread.is_alive():
+            if self.writer_exception is None:
+                self._put_encode_request(self._STOP_MARKER)
+            self.writer_thread.join()
+        self._raise_if_writer_failed()
 
 def is_video_file(file_path):
     SUPPORTED_VIDEO_FILE_EXTENSIONS = {".asf", ".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".wmv",

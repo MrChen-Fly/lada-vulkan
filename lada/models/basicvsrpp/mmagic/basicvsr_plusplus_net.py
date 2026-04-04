@@ -298,6 +298,29 @@ class SecondOrderDeformableAlignment(ModulatedDeformConv2d):
         )
 
         self.init_offset()
+        self.register_buffer(
+            '_flow_offset_projection_weight',
+            self._build_flow_offset_projection_weight(),
+            persistent=False)
+
+    def _build_flow_offset_projection_weight(self):
+        offset_channels = self.deform_groups * self.kernel_size[0] * self.kernel_size[1]
+        if offset_channels % 2 != 0:
+            raise ValueError('Offset flow projection expects an even channel count.')
+
+        weight = torch.zeros(offset_channels, 2, 1, 1)
+        weight[0::2, 1, 0, 0] = 1
+        weight[1::2, 0, 0, 0] = 1
+        return weight
+
+    def _project_flow_for_offset(self, flow):
+        if flow.size(1) != 2:
+            raise ValueError(f'Expected a 2-channel flow tensor, but got shape {tuple(flow.shape)}.')
+
+        weight = self._flow_offset_projection_weight
+        if weight.device != flow.device or weight.dtype != flow.dtype:
+            weight = weight.to(device=flow.device, dtype=flow.dtype)
+        return F.conv2d(flow, weight)
 
     def init_offset(self):
         """Init constant offset."""
@@ -313,16 +336,15 @@ class SecondOrderDeformableAlignment(ModulatedDeformConv2d):
         offset = self.max_residue_magnitude * torch.tanh(
             torch.cat((o1, o2), dim=1))
         offset_1, offset_2 = torch.chunk(offset, 2, dim=1)
-        offset_1 = offset_1 + flow_1.flip(1).repeat(1,
-                                                    offset_1.size(1) // 2, 1,
-                                                    1)
-        offset_2 = offset_2 + flow_2.flip(1).repeat(1,
-                                                    offset_2.size(1) // 2, 1,
-                                                    1)
+        offset_1 = offset_1 + self._project_flow_for_offset(flow_1)
+        offset_2 = offset_2 + self._project_flow_for_offset(flow_2)
         offset = torch.cat([offset_1, offset_2], dim=1)
 
         # mask
         mask = torch.sigmoid(mask)
+
+        if self.export_mode:
+            return super().forward(x, offset, mask)
 
         return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias,
                                              self.stride, self.padding,
