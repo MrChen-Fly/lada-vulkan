@@ -136,6 +136,9 @@ function Install-PythonDependencies {
         uv pip install --force-reinstall (Resolve-Path ".\build_gtk_release\gtk\x64\release\python\pycairo*.whl").Path
     }
 
+    # pnnx is only needed at runtime for NCNN export paths, so keep it packaging-scoped.
+    uv pip install pnnx
+
     # pin setuptools to fix build failure of gobject-introspection. Can be removed once https://github.com/wingtk/gvsbuild/pull/1715 is released
     uv pip install pyinstaller==$global:PYINSTALLER_VERSION "setuptools<81.0.0"
 
@@ -155,10 +158,12 @@ function Create-EXE {
 
     .\venv_release_win\Scripts\Activate.ps1
 
-    $release_dir = (Resolve-Path ".\build_gtk_release\gtk\x64\release").Path
-    $env:Path = $release_dir + "\bin;" + $env:Path
-    $env:LIB = $release_dir + "\lib;" + $env:LIB
-    $env:INCLUDE = $release_dir + "\include;" + $release_dir + "\include\cairo;" + $release_dir + "\include\glib-2.0;" + $release_dir + "\include\gobject-introspection-1.0;" + $release_dir + "\lib\glib-2.0\include;" + $env:INCLUDE
+    if (-not $cliOnly) {
+        $release_dir = (Resolve-Path ".\build_gtk_release\gtk\x64\release").Path
+        $env:Path = $release_dir + "\bin;" + $env:Path
+        $env:LIB = $release_dir + "\lib;" + $env:LIB
+        $env:INCLUDE = $release_dir + "\include;" + $release_dir + "\include\cairo;" + $release_dir + "\include\glib-2.0;" + $release_dir + "\include\gobject-introspection-1.0;" + $release_dir + "\lib\glib-2.0\include;" + $env:INCLUDE
+    }
 
     $specArgs = @()
     if ($cliOnly) { $specArgs += '--cli-only' }
@@ -240,7 +245,7 @@ if (-not $skipWinget) {
 if (-not ($skipGvsbuild -Or $cliOnly)) {
     Build-SystemDependencies $cleanGvsbuild
 }
-if (-not $skipTranslations) {
+if (-not ($skipTranslations -Or $cliOnly)) {
     Compile-Translations
 }
 Download-ModelWeights

@@ -56,6 +56,14 @@ def _get_default_vulkan_cache_dir() -> Path:
     return root / "lada" / "vulkan_cache"
 
 
+def _get_bundled_vulkan_cache_dir() -> Path | None:
+    bundled_cache = os.environ.get("LADA_BUNDLED_VULKAN_CACHE_DIR")
+    if not bundled_cache:
+        return None
+    cache_path = Path(bundled_cache)
+    return cache_path if cache_path.exists() else None
+
+
 def _as_pnnx_path(path: str | Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/")
 
@@ -78,6 +86,9 @@ def _import_pnnx():
             "Vulkan restoration backend requires the optional Python package 'pnnx' "
             "to build ncnn artifacts from BasicVSR++ checkpoints."
         ) from exc
+    resolved_exec_path = os.environ.get("LADA_PNNX_EXEC_PATH")
+    if resolved_exec_path and Path(resolved_exec_path).exists():
+        pnnx.EXEC_PATH = resolved_exec_path
     return pnnx
 
 
@@ -88,10 +99,19 @@ def _resolve_ncnn_basicvsrpp_modular_artifacts(
     artifacts_dir: str | Path | None = None,
 ) -> dict[str, NcnnArtifacts]:
     model_file = Path(model_path)
-    cache_root = Path(artifacts_dir) if artifacts_dir is not None else _get_default_vulkan_cache_dir()
-    artifacts_root = cache_root / (
-        f"{model_file.stem}.vulkan_modular_{frame_count}f_r{_MODULAR_RUNTIME_REVISION}"
-    )
+    cache_dir_name = f"{model_file.stem}.vulkan_modular_{frame_count}f_r{_MODULAR_RUNTIME_REVISION}"
+    if artifacts_dir is not None:
+        artifacts_root = Path(artifacts_dir) / cache_dir_name
+    else:
+        bundled_cache_root = _get_bundled_vulkan_cache_dir()
+        if bundled_cache_root is not None:
+            bundled_artifacts_root = bundled_cache_root / cache_dir_name
+            if bundled_artifacts_root.exists():
+                artifacts_root = bundled_artifacts_root
+            else:
+                artifacts_root = _get_default_vulkan_cache_dir() / cache_dir_name
+        else:
+            artifacts_root = _get_default_vulkan_cache_dir() / cache_dir_name
     artifacts_root.mkdir(parents=True, exist_ok=True)
     return {
         module_name: NcnnArtifacts(

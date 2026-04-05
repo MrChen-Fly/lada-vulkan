@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import ctypes
 import ctypes.util
-import importlib.util
 import sys
 from dataclasses import dataclass
 
@@ -26,17 +26,20 @@ class UnsupportedComputeTargetError(RuntimeError):
 
 
 def _has_vulkan_loader() -> bool:
-    library_name = "vulkan-1" if sys.platform == "win32" else "vulkan"
-    return ctypes.util.find_library(library_name) is not None
+    probe_name = "vulkan-1" if sys.platform == "win32" else "vulkan"
+    if ctypes.util.find_library(probe_name) is not None:
+        return True
 
-
-def _has_python_module(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
+    load_name = "vulkan-1.dll" if sys.platform == "win32" else "libvulkan.so.1"
+    loader = ctypes.WinDLL if sys.platform == "win32" else ctypes.CDLL
+    try:
+        loader(load_name)
+        return True
+    except OSError:
+        return False
 
 
 def _has_ncnn_vulkan_runtime() -> bool:
-    if not _has_python_module("ncnn"):
-        return False
     try:
         from lada.models.basicvsrpp.ncnn_vulkan import (
             import_ncnn_module,

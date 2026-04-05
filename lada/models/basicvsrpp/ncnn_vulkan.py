@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -26,16 +27,77 @@ _CUSTOM_LAYER_SUPPORT_PROBES = {
 }
 
 
+def _iter_local_ncnn_runtime_dirs() -> list[Path]:
+    candidates: list[Path] = []
+
+    runtime_env = os.environ.get("LADA_LOCAL_NCNN_RUNTIME_DIR")
+    if runtime_env:
+        candidates.append(Path(runtime_env))
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(
+            Path(meipass)
+            / "native"
+            / "ncnn_vulkan_runtime"
+            / "build"
+            / "local_runtime"
+        )
+
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates.append(
+        executable_dir
+        / "_internal"
+        / "native"
+        / "ncnn_vulkan_runtime"
+        / "build"
+        / "local_runtime"
+    )
+    candidates.append(
+        executable_dir / "native" / "ncnn_vulkan_runtime" / "build" / "local_runtime"
+    )
+    candidates.append(
+        Path(__file__).resolve().parents[3]
+        / "native"
+        / "ncnn_vulkan_runtime"
+        / "build"
+        / "local_runtime"
+    )
+
+    ordered_existing: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen or not candidate.exists():
+            continue
+        seen.add(resolved)
+        ordered_existing.append(candidate)
+    return ordered_existing
+
+
 def _get_local_ncnn_runtime_dir() -> Path:
-    return Path(__file__).resolve().parents[3] / "native" / "ncnn_vulkan_runtime" / "build" / "local_runtime"
+    runtime_dirs = _iter_local_ncnn_runtime_dirs()
+    if runtime_dirs:
+        return runtime_dirs[0]
+    return (
+        Path(__file__).resolve().parents[3]
+        / "native"
+        / "ncnn_vulkan_runtime"
+        / "build"
+        / "local_runtime"
+    )
 
 
 def import_ncnn_module(*, prefer_local_runtime: bool = True) -> Any:
     """Import the ncnn Python module, preferring the locally built runtime when available."""
     if prefer_local_runtime and "ncnn" not in sys.modules:
-        local_runtime_dir = _get_local_ncnn_runtime_dir()
-        if local_runtime_dir.exists():
-            sys.path.insert(0, str(local_runtime_dir))
+        for local_runtime_dir in reversed(_iter_local_ncnn_runtime_dirs()):
+            runtime_dir_str = str(local_runtime_dir)
+            if runtime_dir_str not in sys.path:
+                sys.path.insert(0, runtime_dir_str)
 
     return importlib.import_module("ncnn")
 
