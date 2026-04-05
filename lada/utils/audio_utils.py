@@ -14,11 +14,33 @@ from lada.utils import video_utils, os_utils
 
 logger = logging.getLogger(__name__)
 
+_MP4_COMPATIBLE_AUDIO_CODECS = {"aac", "mp4a", "alac", "ac3", "eac3"}
+
+
+def _get_output_container_format(output_path: str) -> Optional[str]:
+    file_extension = os.path.splitext(output_path)[1].lower()
+    if file_extension in (".mp4", ".m4v"):
+        return "mp4"
+    if file_extension == ".mkv":
+        return "matroska"
+    return None
+
+
+def _get_audio_reencode_settings(audio_codec: str, output_path: str) -> tuple[bool, list[str], Optional[str]]:
+    output_container_format = _get_output_container_format(output_path)
+    if output_container_format == "mp4":
+        normalized_codec = audio_codec.lower()
+        if normalized_codec not in _MP4_COMPATIBLE_AUDIO_CODECS:
+            return True, ["-c:a", "aac", "-b:a", "192k"], "aac"
+        return False, [], normalized_codec
+    return (not is_output_container_compatible_with_input_audio_codec(audio_codec, output_path), [], None)
+
 def combine_audio_video_files(av_video_metadata: video_utils.VideoMetadata, tmp_v_video_input_path, av_video_output_path):
     start = perf_counter()
     profile: dict[str, str | bool | float | None] = {
         "audio_codec": None,
         "had_audio": False,
+        "output_audio_codec": None,
     }
     probe_started_at = perf_counter()
     audio_codec = get_audio_codec(av_video_metadata.video_file)
@@ -26,10 +48,14 @@ def combine_audio_video_files(av_video_metadata: video_utils.VideoMetadata, tmp_
     profile["audio_codec"] = audio_codec
     if audio_codec:
         profile["had_audio"] = True
-        needs_audio_reencoding = not is_output_container_compatible_with_input_audio_codec(audio_codec, av_video_output_path)
+        needs_audio_reencoding, audio_reencode_args, output_audio_codec = _get_audio_reencode_settings(
+            audio_codec,
+            av_video_output_path,
+        )
         needs_video_delay = av_video_metadata.start_pts > 0
         profile["needs_audio_reencoding"] = needs_audio_reencoding
         profile["needs_video_delay"] = needs_video_delay
+        profile["output_audio_codec"] = output_audio_codec if needs_audio_reencoding else audio_codec
 
         cmd = ["ffmpeg", "-y", "-loglevel", "quiet"]
         cmd += ["-i", av_video_metadata.video_file]
@@ -39,6 +65,7 @@ def combine_audio_video_files(av_video_metadata: video_utils.VideoMetadata, tmp_
         cmd += ["-i", tmp_v_video_input_path]
         if needs_audio_reencoding:
             cmd += ["-c:v", "copy"]
+            cmd += audio_reencode_args
         else:
             cmd += ["-c", "copy"]
         cmd += ["-map", "1:v:0"]
@@ -65,13 +92,9 @@ def get_audio_codec(file_path: str) -> Optional[str]:
     return audio_codec if len(audio_codec) > 0 else None
 
 def is_output_container_compatible_with_input_audio_codec(audio_codec: str, output_path: str) -> bool:
-    file_extension = os.path.splitext(output_path)[1]
-    file_extension = file_extension.lower()
-    if file_extension in ('.mp4', '.m4v'):
-        output_container_format = "mp4"
-    elif file_extension == '.mkv':
-        output_container_format = "matroska"
-    else:
+    output_container_format = _get_output_container_format(output_path)
+    if output_container_format is None:
+        file_extension = os.path.splitext(output_path)[1].lower()
         logger.info(f"Couldn't determine video container format based on file extension: {file_extension}")
         return False
 
