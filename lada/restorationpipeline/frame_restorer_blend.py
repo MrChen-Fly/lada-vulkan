@@ -15,6 +15,10 @@ if TYPE_CHECKING:
     from .frame_restorer import FrameRestorer
 
 
+_ENABLE_VULKAN_BATCH_BLEND_FAST_PATH = False
+_ENABLE_VULKAN_PREPROCESS_BLEND_FAST_PATH = False
+
+
 def restore_frame(
     restorer: "FrameRestorer",
     frame: ImageTensor,
@@ -34,7 +38,7 @@ def restore_frame(
             "blend_patch_padded",
             None,
         )
-        if callable(padded_candidate):
+        if _ENABLE_VULKAN_PREPROCESS_BLEND_FAST_PATH and callable(padded_candidate):
             gpu_blend_patch_padded = padded_candidate
         candidate = getattr(restorer.mosaic_restoration_model, "blend_patch", None)
         if callable(candidate):
@@ -141,6 +145,11 @@ def maybe_batch_blend_single_clip_run(
     clip_index: dict[int, list[Clip]],
     frame_buffer: dict[int, tuple[int, Image | ImageTensor, int]],
 ) -> list[tuple[Image | ImageTensor, int]] | None:
+    # Keep the single-frame Vulkan preprocess blend path as the safe default until
+    # the batched path matches the reference output on full videos.
+    if not _ENABLE_VULKAN_BATCH_BLEND_FAST_PATH:
+        return None
+
     batch_blend_fn = getattr(
         restorer.mosaic_restoration_model,
         "blend_patch_padded_batch",

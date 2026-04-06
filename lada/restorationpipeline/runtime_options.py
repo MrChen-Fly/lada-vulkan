@@ -39,9 +39,7 @@ class RestorationSchedulingOptions:
         options = self.normalized()
         if options.detector_segment_length is not None:
             return min(options.detector_segment_length, max_clip_length)
-        if options.stream_restore_chunk_size is None:
-            return max_clip_length
-        return min(options.stream_restore_chunk_size, max_clip_length)
+        return max_clip_length
 
     def resolve_frame_detection_buffer_limit(
         self,
