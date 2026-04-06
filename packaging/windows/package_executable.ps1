@@ -8,7 +8,8 @@ param (
     [switch]$skipArchive = $false,
     [switch]$cliOnly = $false,
     [switch]$cleanGvsbuild = $false,
-    [string]$extra = "nvidia"
+    [string]$extra = "nvidia",
+    [string]$artifactFlavor = "vulkan"
 )
 
 $global:PYINSTALLER_VERSION = "6.18.0"
@@ -176,9 +177,10 @@ function Create-EXE {
 
 function Create-7ZArchive {
     param(
-        [Parameter(Mandatory)] [string]$extra
+        [Parameter(Mandatory)] [boolean]$cliOnly,
+        [Parameter(Mandatory)] [string]$artifactFlavor
     )
-    Write-Host "Creating 7z archive..."
+    Write-Host "Creating 7z archive for artifact flavor: $artifactFlavor..."
 
     .\venv_release_win\Scripts\Activate.ps1
     $version = $(uv run --no-project python -c 'import lada; print(lada.VERSION)')
@@ -186,7 +188,9 @@ function Create-7ZArchive {
 
     $env:Path = ($env:Programfiles + "\7-Zip;") + $env:Path
 
-    $archive_path = "./dist/lada-v{0}_windows_{1}.7z" -f $version,$extra
+    $archive_prefix = if ($cliOnly) { "lada-cli" } else { "lada" }
+    $archive_base = "{0}-v{1}_windows_{2}" -f $archive_prefix,$version,$artifactFlavor
+    $archive_path = "./dist/{0}.7z" -f $archive_base
 
     # Delete files from prior runs
     Get-ChildItem "./dist" -filter "*.7z*" | ForEach-Object {
@@ -199,7 +203,7 @@ function Create-7ZArchive {
     # Create single-file .7z archive
     $single_chunk = (Get-ChildItem "./dist" -filter "*.7z*" | Where-Object Name -Match '\.7z.\d{3}$' | Measure-Object).Count -eq 1
     if ($single_chunk) {
-        $old = "./dist/lada-v{0}_windows_{1}.7z.001" -f $version,$extra
+        $old = "./dist/{0}.7z.001" -f $archive_base
         $new = $archive_path
         mv $old $new
     } else {
@@ -227,6 +231,14 @@ function Check-Extra {
     }
 }
 
+function Check-ArtifactFlavor {
+    param([Parameter(Mandatory)] [string]$artifactFlavor)
+    if ([string]::IsNullOrWhiteSpace($artifactFlavor)) {
+        Write-Warning "artifactFlavor must not be empty."
+        exit 1
+    }
+}
+
 # ---------------------
 # EXECUTE PACKAGING STEPS
 # ---------------------
@@ -235,6 +247,7 @@ $ErrorActionPreference = "Stop"
 
 Check-ProjectRoot
 Check-Extra $extra
+Check-ArtifactFlavor $artifactFlavor
 
 if (-not $skipWinget) {
     Install-SystemDependencies $cliOnly
@@ -252,5 +265,5 @@ Download-ModelWeights
 Install-PythonDependencies $cliOnly $extra
 Create-EXE $cliOnly $extra
 if (-not $skipArchive) {
-    Create-7ZArchive $extra
+    Create-7ZArchive $cliOnly $artifactFlavor
 }
