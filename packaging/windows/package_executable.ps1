@@ -61,6 +61,99 @@ function Build-SystemDependencies {
     uv pip install gvsbuild==$global:GVSBUILD_VERSION
     uv pip install patch
     uv run --no-project python -m patch -p1 -d venv_gtk_release/lib/site-packages patches/gvsbuild_ffmpeg.patch
+    @'
+from pathlib import Path
+import shutil
+
+path = Path("venv_gtk_release/Lib/site-packages/gvsbuild/projects/pkgconf.py")
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    'archive_url="https://distfiles.ariadne.space/pkgconf/pkgconf-{version}.tar.gz",',
+    'archive_url="https://github.com/pkgconf/pkgconf/archive/refs/tags/pkgconf-{version}.tar.gz",',
+)
+text = text.replace(
+    'hash="ab89d59810d9cad5dfcd508f25efab8ea0b1c8e7bad91c2b6351f13e6a5940d8",',
+    'hash="79721badcad1987dead9c3609eb4877ab9b58821c06bdacb824f2c8897c11f2a",',
+)
+path.write_text(text, encoding="utf-8")
+
+patch_src = Path("patches/gvsbuild_gobject_introspection_py313.patch")
+patch_dst = Path("venv_gtk_release/Lib/site-packages/gvsbuild/patches/gobject-introspection/002-python313-msvccompiler.patch")
+patch_dst.parent.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(patch_src, patch_dst)
+
+project_path = Path("venv_gtk_release/Lib/site-packages/gvsbuild/projects/gobject_introspection.py")
+project_text = project_path.read_text(encoding="utf-8")
+needle = '                "001-incorrect-giscanner-path.patch",\n'
+replacement = (
+    '                "001-incorrect-giscanner-path.patch",\n'
+    '                "002-python313-msvccompiler.patch",\n'
+)
+if "002-python313-msvccompiler.patch" not in project_text:
+    project_text = project_text.replace(needle, replacement)
+project_path.write_text(project_text, encoding="utf-8")
+
+ffmpeg_project_path = Path("venv_gtk_release/Lib/site-packages/gvsbuild/projects/ffmpeg.py")
+ffmpeg_project_text = ffmpeg_project_path.read_text(encoding="utf-8")
+if "from pathlib import Path" not in ffmpeg_project_text:
+    ffmpeg_project_text = ffmpeg_project_text.replace(
+        "import os\n",
+        "import os\nfrom pathlib import Path\n",
+    )
+ffmpeg_needle = """    def build(self):
+        configuration = (
+            "debug-optimized"
+            if self.opts.release_configuration_is_actually_debug_optimized
+            else self.opts.configuration
+        )
+"""
+ffmpeg_replacement = """    def build(self):
+        configuration = (
+            "debug-optimized"
+            if self.opts.release_configuration_is_actually_debug_optimized
+            else self.opts.configuration
+        )
+
+        configure_path = Path(self.build_dir) / "configure"
+        if configure_path.exists():
+            configure_text = configure_path.read_text(encoding="utf-8")
+            strict_probe = (
+                '# Treat unrecognized flags as errors on MSVC\\n'
+                'test_cpp_condition windows.h "_MSC_FULL_VER >= 193030705" &&\\n'
+                '    check_cflags -options:strict\\n'
+                'test_host_cpp_condition windows.h "_MSC_FULL_VER >= 193030705" &&\\n'
+                '    check_host_cflags -options:strict\\n'
+            )
+            strict_probe_replacement = (
+                '# gvsbuild workaround: recent MSVC accepts -options:strict, but FFmpeg configure\\n'
+                '# still probes cl.exe with GCC-style -o arguments during compiler detection.\\n'
+                '# Skip the strict-flag probe so the real MSVC toolchain build can proceed.\\n'
+            )
+            if strict_probe in configure_text and 'Skip the strict-flag probe' not in configure_text:
+                configure_text = configure_text.replace(strict_probe, strict_probe_replacement)
+            localized_probe = (
+                '    elif VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft || { $_cc -v 2>&1 | grep -q clang && $_cc -? > /dev/null 2>&1; }; then\\n'
+            )
+            localized_probe_replacement = (
+                '    elif [ "$toolchain" = "msvc" ] || VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft || { $_cc -v 2>&1 | grep -q clang && $_cc -? > /dev/null 2>&1; }; then\\n'
+            )
+            if localized_probe in configure_text and '[ "$toolchain" = "msvc" ]' not in configure_text:
+                configure_text = configure_text.replace(localized_probe, localized_probe_replacement)
+            localized_ident = (
+                '        if VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft; then\\n'
+            )
+            localized_ident_replacement = (
+                '        if [ "$toolchain" = "msvc" ] || VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft; then\\n'
+            )
+            if localized_ident in configure_text and 'if [ "$toolchain" = "msvc" ] || VSLANG=1033' not in configure_text:
+                configure_text = configure_text.replace(localized_ident, localized_ident_replacement)
+            if '[ "$toolchain" = "msvc" ]' in configure_text:
+                configure_path.write_text(configure_text, encoding="utf-8")
+"""
+if "Skip the strict-flag probe" not in ffmpeg_project_text:
+    ffmpeg_project_text = ffmpeg_project_text.replace(ffmpeg_needle, ffmpeg_replacement)
+ffmpeg_project_path.write_text(ffmpeg_project_text, encoding="utf-8")
+'@ | python -X utf8 -
     uv pip uninstall patch
 
     $cleanArgument = if ($clean) { '--clean' } else { '' }
