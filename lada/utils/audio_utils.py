@@ -26,6 +26,18 @@ def _get_output_container_format(output_path: str) -> Optional[str]:
     return None
 
 
+def is_output_container_compatible_with_input_codec(codec_name: str, output_path: str) -> bool:
+    output_container_format = _get_output_container_format(output_path)
+    if output_container_format is None:
+        file_extension = os.path.splitext(output_path)[1].lower()
+        logger.info(f"Couldn't determine video container format based on file extension: {file_extension}")
+        return False
+
+    buf = io.BytesIO()
+    with av.open(buf, 'w', output_container_format) as container:
+        return codec_name in container.supported_codecs
+
+
 def _get_audio_reencode_settings(audio_codec: str, output_path: str) -> tuple[bool, list[str], Optional[str]]:
     output_container_format = _get_output_container_format(output_path)
     if output_container_format == "mp4":
@@ -34,6 +46,66 @@ def _get_audio_reencode_settings(audio_codec: str, output_path: str) -> tuple[bo
             return True, ["-c:a", "aac", "-b:a", "192k"], "aac"
         return False, [], normalized_codec
     return (not is_output_container_compatible_with_input_audio_codec(audio_codec, output_path), [], None)
+
+
+def can_copy_video_file_to_output(
+    video_codec: str | None,
+    audio_codec: str | None,
+    output_path: str,
+) -> tuple[bool, str | None]:
+    output_container_format = _get_output_container_format(output_path)
+    if output_container_format is None:
+        return False, f"unsupported output container '{os.path.splitext(output_path)[1].lower()}'"
+
+    if not video_codec:
+        return False, "missing input video codec"
+    if not is_output_container_compatible_with_input_codec(video_codec.lower(), output_path):
+        return False, f"video codec '{video_codec}' is not compatible with {output_container_format}"
+
+    if audio_codec and not is_output_container_compatible_with_input_audio_codec(audio_codec.lower(), output_path):
+        return False, f"audio codec '{audio_codec}' is not compatible with {output_container_format}"
+    return True, None
+
+
+def copy_or_remux_video_file(source_video_path: str, output_path: str) -> dict[str, str | float]:
+    start = perf_counter()
+    profile: dict[str, str | float] = {
+        "mode": "copy",
+        "source_video_path": source_video_path,
+    }
+    source_extension = os.path.splitext(source_video_path)[1].lower()
+    output_extension = os.path.splitext(output_path)[1].lower()
+
+    if source_extension == output_extension:
+        copy_started_at = perf_counter()
+        shutil.copy(source_video_path, output_path)
+        profile["copy_s"] = perf_counter() - copy_started_at
+        profile["total_s"] = perf_counter() - start
+        return profile
+
+    profile["mode"] = "remux"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", source_video_path, "-map", "0", "-c", "copy"]
+    if _get_output_container_format(output_path) == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += [output_path]
+
+    remux_started_at = perf_counter()
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        startupinfo=os_utils.get_subprocess_startup_info(),
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"Failed to remux '{source_video_path}' to '{output_path}'"
+            + (f": {stderr}" if stderr else ".")
+        )
+
+    profile["remux_s"] = perf_counter() - remux_started_at
+    profile["total_s"] = perf_counter() - start
+    return profile
 
 def combine_audio_video_files(av_video_metadata: video_utils.VideoMetadata, tmp_v_video_input_path, av_video_output_path):
     start = perf_counter()
@@ -92,12 +164,4 @@ def get_audio_codec(file_path: str) -> Optional[str]:
     return audio_codec if len(audio_codec) > 0 else None
 
 def is_output_container_compatible_with_input_audio_codec(audio_codec: str, output_path: str) -> bool:
-    output_container_format = _get_output_container_format(output_path)
-    if output_container_format is None:
-        file_extension = os.path.splitext(output_path)[1].lower()
-        logger.info(f"Couldn't determine video container format based on file extension: {file_extension}")
-        return False
-
-    buf = io.BytesIO()
-    with av.open(buf, 'w', output_container_format) as container:
-        return audio_codec in container.supported_codecs
+    return is_output_container_compatible_with_input_codec(audio_codec, output_path)

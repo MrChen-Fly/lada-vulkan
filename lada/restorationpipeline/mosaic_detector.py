@@ -23,6 +23,11 @@ from .clip_units import ClipDescriptor, Scene
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
 
+
+def _scene_list_contains_identity(scenes: list[Scene], target: Scene) -> bool:
+    return any(scene is target for scene in scenes)
+
+
 class MosaicDetector:
     def __init__(
         self,
@@ -183,11 +188,11 @@ class MosaicDetector:
         for current_scene in scenes:
             is_scene_finished = current_scene.frame_end < frame_num or eof
             is_scene_ready = len(current_scene) >= self.segment_length
-            if (is_scene_finished or is_scene_ready) and current_scene not in completed_scenes:
+            if (is_scene_finished or is_scene_ready) and not _scene_list_contains_identity(completed_scenes, current_scene):
                 completed_scenes.append(current_scene)
-                other_scenes = [other for other in scenes if other != current_scene]
+                other_scenes = [other for other in scenes if other is not current_scene]
                 for other_scene in other_scenes:
-                    if other_scene.frame_start < current_scene.frame_start and other_scene not in completed_scenes:
+                    if other_scene.frame_start < current_scene.frame_start and not _scene_list_contains_identity(completed_scenes, other_scene):
                         completed_scenes.append(other_scene)
 
         for completed_scene in sorted(completed_scenes, key=lambda s: s.frame_start):
@@ -207,7 +212,7 @@ class MosaicDetector:
                 queue_marker = self._emit_scene_descriptor(emitted_scene)
                 if queue_marker is STOP_MARKER:
                     return STOP_MARKER
-            if len(completed_scene) == 0 and completed_scene in scenes:
+            if len(completed_scene) == 0 and _scene_list_contains_identity(scenes, completed_scene):
                 scenes.remove(completed_scene)
         return None
 

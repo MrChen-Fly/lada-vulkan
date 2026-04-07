@@ -410,9 +410,23 @@ def restore_cropped_clip_frames(
     restorer.profiler.reset()
     restorer._native_clip_profile_snapshot = {}
     started_at = perf_counter()
+    if not clip_frames:
+        finalize_last_profile(restorer, total_s=perf_counter() - started_at)
+        return []
+
+    native_input_frames = clip_frames
+    center_output_index = 0
+    if len(clip_frames) == 1:
+        native_input_frames = _build_replicated_clip_window(
+            clip_frames,
+            center_index=0,
+            frame_count=restorer.frame_count,
+        )
+        center_output_index = restorer.frame_count // 2
+
     with restorer.profiler.measure("vulkan_recurrent_clip_native_s"):
         outputs = restorer.native_clip_runner.restore_bgr_u8_resized(
-            clip_frames,
+            native_input_frames,
             target_size=size,
             resize_reference_shape=resize_reference_shape,
             pad_mode=pad_mode,
@@ -420,6 +434,8 @@ def restore_cropped_clip_frames(
     merge_native_clip_profile(restorer)
     with restorer.profiler.measure("cpu_output_postprocess_s"):
         result = [_array_to_uint8_frame(output) for output in outputs]
+        if len(clip_frames) == 1:
+            result = [result[center_output_index]]
     finalize_last_profile(restorer, total_s=perf_counter() - started_at)
     return result
 

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import textwrap
@@ -40,6 +41,7 @@ except ModuleNotFoundError:
         raise
 
 from lada import VERSION, ModelFiles
+from lada.cli import batch_runner
 from lada.cli import utils
 from lada.compute_targets import (
     describe_compute_target_issue,
@@ -89,6 +91,18 @@ def _write_timing_report(report_path: str, report: dict[str, object]) -> None:
     with open(report_path, "w", encoding="utf-8") as file_obj:
         json.dump(report, file_obj, indent=2, ensure_ascii=False)
 
+
+def _is_full_video_passthrough(frame_restorer_profile: dict[str, object]) -> bool:
+    mosaic_detector_profile = frame_restorer_profile.get("mosaic_detector")
+    if not isinstance(mosaic_detector_profile, dict):
+        return False
+    return (
+        int(frame_restorer_profile.get("clips_restored", 0)) == 0
+        and int(frame_restorer_profile.get("frames_blended", 0)) == 0
+        and int(mosaic_detector_profile.get("clips_emitted", 0)) == 0
+    )
+
+
 def setup_argparser() -> argparse.ArgumentParser:
     examples_header_text = _("Examples:")
 
@@ -133,6 +147,20 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_general.add_argument('--version', action='store_true', help=_("Display version and exit"))
     group_general.add_argument('--help', action='store_true', help=_("Show this help message and exit"))
 
+    batch_group = parser.add_argument_group(_('Batch Processing'))
+    batch_group.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=False, help=_('Recursively scan nested directories when the input is a directory. (default: %(default)s)'))
+    batch_group.add_argument('--preserve-relative-paths', action=argparse.BooleanOptionalAction, default=False, help=_('Preserve the input directory structure under the output directory. (default: %(default)s)'))
+    batch_group.add_argument('--backup-root', type=str, default=None, help=_('Optional directory used to store source video backups before conversion'))
+    batch_group.add_argument('--batch-state-path', type=str, default=None, help=_('Optional JSON file used to persist batch progress and failed-file retry order'))
+    batch_group.add_argument('--force-backup', action=argparse.BooleanOptionalAction, default=False, help=_('Rewrite source backups even if an identical backup already exists. (default: %(default)s)'))
+    batch_group.add_argument('--force-reconvert', action=argparse.BooleanOptionalAction, default=False, help=_('Re-run conversion even if the final output file already exists. (default: %(default)s)'))
+    batch_group.add_argument('--retry-count', type=int, default=0, help=_('Number of additional retries for a failed file in batch mode. (default: %(default)s)'))
+    batch_group.add_argument('--retry-delay-seconds', type=int, default=3, help=_('Delay between failed-file retries in batch mode. (default: %(default)s)'))
+    batch_group.add_argument('--retry-failed-first', action=argparse.BooleanOptionalAction, default=False, help=_('When resuming a batch, retry previously failed files before untouched files. (default: %(default)s)'))
+    batch_group.add_argument('--working-output-extension', type=str, default=None, help=_('Temporary encoded output extension used before moving to the final output path, for example ".mp4"'))
+    batch_group.add_argument('--dry-run', action=argparse.BooleanOptionalAction, default=False, help=_('Show planned batch actions without writing backups or outputs. (default: %(default)s)'))
+    batch_group.add_argument('--max-files', type=int, default=0, help=_('Limit the number of directory inputs processed in batch mode. 0 keeps all files. (default: %(default)s)'))
+
     export = parser.add_argument_group(_('Export'))
     export.add_argument('--encoding-preset', type=str, default=get_default_preset_name(), help=_('Select encoding preset by name. Use "--list-encoding-presets" to see what\'s available. Ignored if "--encoder" and "--encoder-options" are used (default: %(default)s)'))
     export.add_argument('--list-encoding-presets', action='store_true', help=_("List available encoding presets and exit"))
@@ -156,9 +184,11 @@ def setup_argparser() -> argparse.ArgumentParser:
     return parser
 
 def process_video_file(input_path: str, output_path: str, temp_dir_path: str, device: torch.device, mosaic_restoration_model, mosaic_detection_model,
-                       mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start):
+                       mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start,
+                       working_output_path: str | None = None):
     profiler = WallClockProfiler()
     started_at = perf_counter()
+    encoded_output_path = working_output_path if working_output_path else output_path
     with profiler.measure("video_metadata_probe_s"):
         video_metadata = get_video_meta_data(input_path)
 
@@ -170,8 +200,11 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
     audio_profile: dict[str, object] = {}
     frame_restorer_profile: dict[str, object] = {}
     video_writer: VideoWriter | None = None
-    video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
+    error_message: str | None = None
+    video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(encoded_output_path)[0])}.tmp{os.path.splitext(encoded_output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
+    if working_output_path:
+        pathlib.Path(encoded_output_path).parent.mkdir(exist_ok=True, parents=True)
     frame_restorer_progressbar = utils.Progressbar(video_metadata)
     try:
         with profiler.measure("frame_restorer_start_s"):
@@ -207,6 +240,7 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
         if isinstance(e, KeyboardInterrupt):
             raise e
         else:
+            error_message = str(e)
             print("Error on export", e)
     finally:
         if video_writer is not None:
@@ -215,6 +249,7 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                     video_writer.release()
             except Exception as e:
                 success = False
+                error_message = str(e)
                 print("Error on export", e)
         with profiler.measure("frame_restorer_stop_s"):
             frame_restorer.stop()
@@ -222,12 +257,59 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
         frame_restorer_progressbar.close(ensure_completed_bar=success)
 
     if success:
-        print(_("Processing audio"))
-        with profiler.measure("audio_mux_total_s"):
-            audio_profile = audio_utils.combine_audio_video_files(video_metadata, video_tmp_file_output_path, output_path)
+        if _is_full_video_passthrough(frame_restorer_profile):
+            print(_("No mosaic clips detected, preserving original video"))
+            with profiler.measure("output_passthrough_total_s"):
+                input_audio_codec = audio_utils.get_audio_codec(video_metadata.video_file)
+                can_copy_original, passthrough_reason = audio_utils.can_copy_video_file_to_output(
+                    video_metadata.codec_name,
+                    input_audio_codec,
+                    output_path,
+                )
+                if can_copy_original:
+                    audio_profile = audio_utils.copy_or_remux_video_file(input_path, output_path)
+                    audio_profile["passthrough_original_video"] = True
+                    if os.path.exists(video_tmp_file_output_path):
+                        os.remove(video_tmp_file_output_path)
+                    if (
+                        working_output_path
+                        and os.path.exists(encoded_output_path)
+                        and os.path.normcase(encoded_output_path) != os.path.normcase(output_path)
+                    ):
+                        os.remove(encoded_output_path)
+                else:
+                    print(
+                        _("Preserving original video skipped, falling back to encoded passthrough"),
+                        passthrough_reason,
+                    )
+                    audio_profile = audio_utils.combine_audio_video_files(
+                        video_metadata,
+                        video_tmp_file_output_path,
+                        encoded_output_path,
+                    )
+                    audio_profile["passthrough_original_video"] = False
+                    audio_profile["passthrough_fallback"] = "encoded_passthrough"
+                    audio_profile["passthrough_reason"] = passthrough_reason
+        else:
+            print(_("Processing audio"))
+            with profiler.measure("audio_mux_total_s"):
+                audio_profile = audio_utils.combine_audio_video_files(video_metadata, video_tmp_file_output_path, encoded_output_path)
+        if (
+            encoded_output_path != output_path
+            and os.path.exists(encoded_output_path)
+        ):
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(encoded_output_path, output_path)
     else:
         if os.path.exists(video_tmp_file_output_path):
             os.remove(video_tmp_file_output_path)
+        if (
+            working_output_path
+            and os.path.exists(encoded_output_path)
+            and os.path.normcase(encoded_output_path) != os.path.normcase(output_path)
+        ):
+            os.remove(encoded_output_path)
 
     report: dict[str, object] = {
         "input_path": input_path,
@@ -238,7 +320,10 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
         "stages": profiler.snapshot(total_s=perf_counter() - started_at),
         "frame_restorer": frame_restorer_profile,
         "audio_mux": audio_profile,
+        "passthrough_original_video": bool(audio_profile.get("passthrough_original_video")),
         "output_exists": os.path.exists(output_path),
+        "working_output_path": encoded_output_path if encoded_output_path != output_path else None,
+        "error_message": error_message,
     }
     if os.path.exists(output_path):
         report["output_size_bytes"] = os.path.getsize(output_path)
@@ -301,6 +386,37 @@ def main():
         if args.temporary_directory and not os.path.isdir(args.temporary_directory):
             print(_("Temporary directory {temporary_path} doesn't exist. Creating...").format(temporary_path=args.temporary_directory))
             os.makedirs(args.temporary_directory)
+        if args.working_output_extension and not args.working_output_extension.startswith("."):
+            args.working_output_extension = "." + args.working_output_extension
+        if args.retry_count < 0:
+            print(_("Invalid retry count"))
+            sys.exit(1)
+        if args.retry_delay_seconds < 0:
+            print(_("Invalid retry delay"))
+            sys.exit(1)
+        if args.max_files < 0:
+            print(_("Invalid max files value"))
+            sys.exit(1)
+        if args.backup_root and os.path.isfile(args.backup_root):
+            print(_("Invalid backup directory"))
+            sys.exit(1)
+
+    use_batch_runner = (
+        os.path.isdir(args.input)
+        and (
+            args.recursive
+            or args.preserve_relative_paths
+            or args.backup_root is not None
+            or args.batch_state_path is not None
+            or args.force_backup
+            or args.force_reconvert
+            or args.retry_count > 0
+            or args.retry_failed_first
+            or args.working_output_extension is not None
+            or args.dry_run
+            or args.max_files > 0
+        )
+    )
 
     with command_profiler.measure("cli_model_path_resolution_s"):
         if detection_modelfile := ModelFiles.get_detection_model_by_name(args.mosaic_detection_model):
@@ -350,30 +466,39 @@ def main():
             if compute_target.torch_device is not None
             else torch.device("cpu")
         )
-    with command_profiler.measure("cli_model_load_s"):
-        loaded_models = load_models(
-            args.device, compute_target.torch_device and torch.device(compute_target.torch_device), mosaic_restoration_model_name, mosaic_restoration_model_path, args.mosaic_restoration_config_path,
-            mosaic_detection_model_path, args.fp16, args.detect_face_mosaics
-        )
-        mosaic_detection_model = loaded_models.detection_model
-        mosaic_restoration_model = loaded_models.restoration_model
-        preferred_pad_mode = loaded_models.preferred_pad_mode
+    mosaic_detection_model = None
+    mosaic_restoration_model = None
+    preferred_pad_mode = None
+    if not (use_batch_runner and args.dry_run):
+        with command_profiler.measure("cli_model_load_s"):
+            loaded_models = load_models(
+                args.device, compute_target.torch_device and torch.device(compute_target.torch_device), mosaic_restoration_model_name, mosaic_restoration_model_path, args.mosaic_restoration_config_path,
+                mosaic_detection_model_path, args.fp16, args.detect_face_mosaics
+            )
+            mosaic_detection_model = loaded_models.detection_model
+            mosaic_restoration_model = loaded_models.restoration_model
+            preferred_pad_mode = loaded_models.preferred_pad_mode
 
     with command_profiler.measure("cli_input_output_setup_s"):
-        input_files, output_files = utils.setup_input_and_output_paths(args.input, args.output, args.output_file_pattern)
+        if use_batch_runner:
+            input_files = []
+            output_files = []
+        else:
+            input_files, output_files = utils.setup_input_and_output_paths(args.input, args.output, args.output_file_pattern)
 
-    single_file_input = len(input_files) == 1
+    single_file_input = (len(input_files) == 1) if not use_batch_runner else False
     file_reports: list[dict[str, object]] = []
 
+    batch_failed_count = 0
     with command_profiler.measure("cli_process_inputs_s"):
-        for input_path, output_path in zip(input_files, output_files):
-            if not single_file_input:
-                print(f"{os.path.basename(input_path)}:")
-            try:
-                file_reports.append(
-                    process_video_file(
-                        input_path=input_path,
-                        output_path=output_path,
+        if use_batch_runner:
+            batch_output_root = args.output if args.output else args.input
+            if args.dry_run:
+                def batch_process_file(**kwargs):
+                    raise RuntimeError(f"Dry-run unexpectedly attempted to process a file: {kwargs.get('input_path')}")
+            else:
+                def batch_process_file(**kwargs):
+                    return process_video_file(
                         temp_dir_path=args.temporary_directory,
                         device=device,
                         mosaic_restoration_model=mosaic_restoration_model,
@@ -384,11 +509,52 @@ def main():
                         encoder=encoder,
                         encoder_options=encoder_options,
                         mp4_fast_start=args.mp4_fast_start,
+                        **kwargs,
                     )
-                )
-            except KeyboardInterrupt:
-                print(_("Received Ctrl-C, stopping restoration."))
-                break
+            batch_result = batch_runner.run_batch(
+                input_root=args.input,
+                output_root=batch_output_root,
+                output_file_pattern=args.output_file_pattern,
+                process_file=batch_process_file,
+                recursive=args.recursive,
+                preserve_relative_paths=args.preserve_relative_paths,
+                backup_root=args.backup_root,
+                state_path=args.batch_state_path,
+                force_backup=args.force_backup,
+                force_reconvert=args.force_reconvert,
+                retry_count=args.retry_count,
+                retry_delay_seconds=args.retry_delay_seconds,
+                retry_failed_first=args.retry_failed_first,
+                working_output_extension=args.working_output_extension,
+                dry_run=args.dry_run,
+                max_files=args.max_files,
+            )
+            file_reports = batch_result.file_reports
+            batch_failed_count = batch_result.failed_count
+        else:
+            for input_path, output_path in zip(input_files, output_files):
+                if not single_file_input:
+                    print(f"{os.path.basename(input_path)}:")
+                try:
+                    file_reports.append(
+                        process_video_file(
+                            input_path=input_path,
+                            output_path=output_path,
+                            temp_dir_path=args.temporary_directory,
+                            device=device,
+                            mosaic_restoration_model=mosaic_restoration_model,
+                            mosaic_detection_model=mosaic_detection_model,
+                            mosaic_restoration_model_name=mosaic_restoration_model_name,
+                            preferred_pad_mode=preferred_pad_mode,
+                            max_clip_length=args.max_clip_length,
+                            encoder=encoder,
+                            encoder_options=encoder_options,
+                            mp4_fast_start=args.mp4_fast_start,
+                        )
+                    )
+                except KeyboardInterrupt:
+                    print(_("Received Ctrl-C, stopping restoration."))
+                    break
 
     command_total_s = perf_counter() - _CLI_PROCESS_START
     command_report = {
@@ -414,6 +580,9 @@ def main():
     if args.timing_report_path:
         _write_timing_report(args.timing_report_path, command_report)
         print(_("Timing report written to {path}").format(path=args.timing_report_path))
+
+    if batch_failed_count > 0:
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
