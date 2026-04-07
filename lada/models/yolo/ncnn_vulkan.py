@@ -637,14 +637,12 @@ class NcnnVulkanYoloSegmentationModel(BaseYolo11SegmentationModel):
         """Preprocess one batch through native NCNN image operators instead of Python LetterBox."""
         with self._measure_profile("detector_preprocess_total_s"):
             with self._measure_profile("detector_preprocess_letterbox_s"):
-                if self.gpu_runner is not None and hasattr(self.gpu_runner, "preprocess_bgr_u8_batch"):
-                    image_batch = [self._to_numpy_image(image) for image in imgs]
-                    return self.gpu_runner.preprocess_bgr_u8_batch(
-                        image_batch,
-                        [int(self.imgsz[0]), int(self.imgsz[1])],
-                    )
-                if self.gpu_runner is not None and hasattr(self.gpu_runner, "preprocess_bgr_u8"):
-                    return [self._letterbox_to_vulkan_tensor(image) for image in imgs]
+                # NOTE:
+                # The native preprocess_bgr_u8 bridge currently produces numerically incorrect
+                # detector inputs on some real-world clips, which causes systematic false
+                # negatives in the Vulkan detector path. Keep the fused Vulkan inference /
+                # postprocess path, but build the NCNN input Mats via the proven CPU-side
+                # letterbox path until the shader implementation is fixed.
                 return [self._letterbox_to_ncnn_mat(image) for image in imgs]
 
     def _to_ncnn_input_mat(self, input_frame: Any):

@@ -266,6 +266,10 @@ def emit_frame_restoration_output(
     frame: Image | ImageTensor,
     frame_pts: int,
 ) -> None:
+    if isinstance(frame, torch.Tensor):
+        # Detach queue consumers from live torch storage before the worker keeps
+        # progressing; a raw tensor reference can still be observed as mutated.
+        frame = np.ascontiguousarray(frame.detach().cpu().numpy()).copy()
     with restorer.profiler.measure("frame_restoration_queue_put_s"):
         restorer.frame_restoration_queue.put((frame, frame_pts))
 

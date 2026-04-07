@@ -3,8 +3,10 @@ from __future__ import annotations
 from time import perf_counter
 from typing import TYPE_CHECKING
 
+import cv2
+
 from lada.models.basicvsrpp.ncnn_vulkan import is_ncnn_vulkan_tensor
-from lada.utils import Image, ImageTensor
+from lada.utils import Image, ImageTensor, image_utils
 
 from .basicvsrpp_vulkan_io import (
     _array_to_uint8_frame,
@@ -28,30 +30,52 @@ _BRANCH_NAMES = ("backward_1", "forward_1", "backward_2", "forward_2")
 _RECURRENT_GPU_BRIDGE_MAX_FEATURE_AREA = 128 * 128
 
 
+def _resize_cropped_frames_for_runtime(
+    clip_frames: list[Image | ImageTensor],
+    *,
+    size: int,
+    resize_reference_shape: tuple[int, int],
+    pad_mode: str,
+) -> list[Image | ImageTensor]:
+    """Resize cropped clip frames with the same geometry used by `Clip.from_descriptor`."""
+    reference_width = max(int(resize_reference_shape[0]), 1)
+    reference_height = max(int(resize_reference_shape[1]), 1)
+    scale_width = size / reference_width
+    scale_height = size / reference_height
+
+    prepared_frames: list[Image | ImageTensor] = []
+    for frame in clip_frames:
+        resize_shape = (
+            max(1, int(frame.shape[0] * scale_height)),
+            max(1, int(frame.shape[1] * scale_width)),
+        )
+        resized_frame = image_utils.resize(
+            frame,
+            resize_shape,
+            interpolation=cv2.INTER_LINEAR,
+        )
+        padded_frame, _ = image_utils.pad_image(
+            resized_frame,
+            size,
+            size,
+            mode=pad_mode,
+        )
+        prepared_frames.append(padded_frame)
+    return prepared_frames
+
+
 def preprocess_clip_frames_to_runtime_inputs(
     restorer: "NcnnVulkanBasicvsrppMosaicRestorer",
     clip_frames: list[Image | ImageTensor],
     *,
     prefer_gpu_bridge: bool,
 ) -> list[object]:
-    if (
-        prefer_gpu_bridge
-        and restorer.runtime_features.use_vulkan_frame_preprocess
-        and restorer.frame_preprocess_runner is not None
-    ):
-        restorer.profiler.add_duration("cpu_frame_preprocess_s", 0.0)
-        with restorer.profiler.measure("vulkan_frame_preprocess_s"):
-            if restorer.runtime_features.use_vulkan_frame_preprocess_batch:
-                restorer.profiler.add_count("vulkan_frame_preprocess_batch")
-                return restorer.frame_preprocess_runner.preprocess_bgr_u8_frames(
-                    clip_frames
-                )
-            restorer.profiler.add_count("vulkan_frame_preprocess_single")
-            return [
-                restorer.frame_preprocess_runner.preprocess_bgr_u8_frame(frame)
-                for frame in clip_frames
-            ]
-
+    del prefer_gpu_bridge
+    # NOTE:
+    # The native BasicVSR++ uint8 preprocess bridge currently feeds numerically incorrect
+    # tensors into the exported NCNN graph on real clips, which collapses restored patches
+    # to near-black output. Keep the GPU graph for the heavy model work, but build the CHW
+    # float32 inputs on CPU until the Vulkan preprocess shader is fixed.
     restorer.profiler.add_duration("vulkan_frame_preprocess_s", 0.0)
     with restorer.profiler.measure("cpu_frame_preprocess_s"):
         return [_frame_to_chw_float32(frame) for frame in clip_frames]
@@ -286,17 +310,9 @@ def restore_clip_recurrent_native(
     if restorer.native_clip_runner is None:
         raise RuntimeError("Native BasicVSR++ clip runner is not initialized.")
 
-    if restorer.native_clip_runner.supports_bgr_u8_input:
-        restorer.profiler.add_duration("cpu_frame_preprocess_s", 0.0)
-        restorer.profiler.add_duration("vulkan_frame_preprocess_s", 0.0)
-        with restorer.profiler.measure("vulkan_recurrent_clip_native_s"):
-            outputs = restorer.native_clip_runner.restore_bgr_u8(clip_frames)
-        merge_native_clip_profile(restorer)
-        with restorer.profiler.measure("cpu_output_postprocess_s"):
-            return [_array_to_uint8_frame(output) for output in outputs]
-
     with restorer.profiler.measure("cpu_frame_preprocess_s"):
         lqs = [_frame_to_chw_float32(frame) for frame in clip_frames]
+    restorer.profiler.add_duration("vulkan_frame_preprocess_s", 0.0)
     with restorer.profiler.measure("vulkan_recurrent_clip_native_s"):
         outputs = restorer.native_clip_runner.restore(lqs)
     merge_native_clip_profile(restorer)
@@ -414,28 +430,24 @@ def restore_cropped_clip_frames(
         finalize_last_profile(restorer, total_s=perf_counter() - started_at)
         return []
 
-    native_input_frames = clip_frames
+    native_input_frames = _resize_cropped_frames_for_runtime(
+        clip_frames,
+        size=size,
+        resize_reference_shape=resize_reference_shape,
+        pad_mode=pad_mode,
+    )
     center_output_index = 0
     if len(clip_frames) == 1:
         native_input_frames = _build_replicated_clip_window(
-            clip_frames,
+            native_input_frames,
             center_index=0,
             frame_count=restorer.frame_count,
         )
         center_output_index = restorer.frame_count // 2
 
-    with restorer.profiler.measure("vulkan_recurrent_clip_native_s"):
-        outputs = restorer.native_clip_runner.restore_bgr_u8_resized(
-            native_input_frames,
-            target_size=size,
-            resize_reference_shape=resize_reference_shape,
-            pad_mode=pad_mode,
-        )
-    merge_native_clip_profile(restorer)
-    with restorer.profiler.measure("cpu_output_postprocess_s"):
-        result = [_array_to_uint8_frame(output) for output in outputs]
-        if len(clip_frames) == 1:
-            result = [result[center_output_index]]
+    result = restore_clip_recurrent_native(restorer, native_input_frames)
+    if len(clip_frames) == 1:
+        result = [result[center_output_index]]
     finalize_last_profile(restorer, total_s=perf_counter() - started_at)
     return result
 

@@ -581,6 +581,10 @@ class VideoWriter:
         # See https://codeberg.org/ladaapp/lada/pulls/33 for more information/discussion.
         if self._release_started:
             raise RuntimeError("VideoWriter.write() cannot be called after release().")
+        if isinstance(frame, torch.Tensor):
+            # The background encoder thread must not observe later mutations of the
+            # live restoration tensor; snapshot CPU bytes before enqueueing.
+            frame = np.ascontiguousarray(frame.detach().cpu().numpy()).copy()
         pixel_format = "bgr24" if bgr2rgb else "rgb24"
         self._put_encode_request((frame, frame_pts, pixel_format))
 
