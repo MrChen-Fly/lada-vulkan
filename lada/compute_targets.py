@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from lada.utils.os_utils import has_mps
+from lada.utils.os_utils import gpu_has_fp16_acceleration, has_mps
 
 
 @dataclass(frozen=True)
@@ -203,3 +203,18 @@ def resolve_torch_device(target_id: str) -> torch.device:
             f"Compute target '{normalized_target_id}' does not map to a torch.device."
         )
     return torch.device(target.torch_device)
+
+
+def default_fp16_enabled_for_compute_target(target_id: str | None) -> bool:
+    """Return the default fp16 toggle for one resolved compute target."""
+    normalized_target_id = normalize_compute_target_id(target_id)
+    target = get_compute_target(normalized_target_id, include_experimental=True)
+    if target is None:
+        return gpu_has_fp16_acceleration()
+    if target.runtime == "vulkan":
+        # The local NCNN Vulkan path is designed around fp16 artifacts; callers can still opt out
+        # with `--no-fp16` when they need conservative compatibility.
+        return True
+    if target.torch_device is None:
+        return False
+    return gpu_has_fp16_acceleration(torch.device(target.torch_device))

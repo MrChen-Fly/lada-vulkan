@@ -44,6 +44,7 @@ from lada import VERSION, ModelFiles
 from lada.cli import batch_runner
 from lada.cli import utils
 from lada.compute_targets import (
+    default_fp16_enabled_for_compute_target,
     describe_compute_target_issue,
     get_compute_target,
     get_default_compute_target,
@@ -51,7 +52,6 @@ from lada.compute_targets import (
     resolve_torch_device,
 )
 from lada.utils import audio_utils, video_utils
-from lada.utils.os_utils import gpu_has_fp16_acceleration
 from lada.restorationpipeline.frame_restorer import FrameRestorer
 from lada.restorationpipeline import load_models
 from lada.restorationpipeline.runtime_profiling import WallClockProfiler
@@ -103,6 +103,22 @@ def _is_full_video_passthrough(frame_restorer_profile: dict[str, object]) -> boo
     )
 
 
+def _cleanup_intermediate_outputs(
+    *,
+    video_tmp_file_output_path: str,
+    working_output_path: str | None,
+    output_path: str,
+) -> None:
+    if os.path.exists(video_tmp_file_output_path):
+        os.remove(video_tmp_file_output_path)
+    if (
+        working_output_path
+        and os.path.exists(working_output_path)
+        and os.path.normcase(working_output_path) != os.path.normcase(output_path)
+    ):
+        os.remove(working_output_path)
+
+
 def setup_argparser() -> argparse.ArgumentParser:
     examples_header_text = _("Examples:")
 
@@ -141,7 +157,7 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_general.add_argument('--temporary-directory', type=str, default=tempfile.gettempdir(), help=_('Directory for temporary video files during restoration process. Alternatively, you can use the environment variable TMPDIR. (default: %(default)s)'))
     group_general.add_argument('--output-file-pattern', type=str, default="{orig_file_name}.restored.mp4", help=_("Pattern used to determine output file name(s). Used when input is a directory, or a file but no output path was specified. Must include the placeholder '{orig_file_name}'. (default: %(default)s)"))
     group_general.add_argument('--device', type=str, default=get_default_compute_target(), help=_('Device used for running Restoration and Detection models. Use "--list-devices" to see what\'s available (default: %(default)s)'))
-    group_general.add_argument('--fp16', action=argparse.BooleanOptionalAction, default=gpu_has_fp16_acceleration(), help=_("Reduces VRAM usage and may increase speed on modern GPUs, with negligible quality difference. (default: %(default)s)"))
+    group_general.add_argument('--fp16', action=argparse.BooleanOptionalAction, default=None, help=_("Reduces VRAM usage and may increase speed on supported GPUs, with negligible quality difference. Default: auto"))
     group_general.add_argument('--timing-report-path', type=str, default=None, help=_('Optional path used to write a JSON timing report for the full CLI pipeline'))
     group_general.add_argument('--list-devices', action='store_true', help=_("List available devices and exit"))
     group_general.add_argument('--version', action='store_true', help=_("Display version and exit"))
@@ -260,23 +276,29 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
         if _is_full_video_passthrough(frame_restorer_profile):
             print(_("No mosaic clips detected, preserving original video"))
             with profiler.measure("output_passthrough_total_s"):
+                input_extension = os.path.splitext(input_path)[1].lower()
+                output_extension = os.path.splitext(output_path)[1].lower()
                 input_audio_codec = audio_utils.get_audio_codec(video_metadata.video_file)
-                can_copy_original, passthrough_reason = audio_utils.can_copy_video_file_to_output(
-                    video_metadata.codec_name,
-                    input_audio_codec,
-                    output_path,
-                )
+                # If the final output keeps the original suffix, preserve the source bytes directly.
+                # This is required for batch workflows that intentionally keep ".webm" file names even
+                # when the original container/codec combination is non-standard for that extension.
+                can_copy_original = input_extension == output_extension
+                passthrough_reason = "matching_extension_direct_copy" if can_copy_original else None
+                if not can_copy_original:
+                    can_copy_original, passthrough_reason = audio_utils.can_copy_video_file_to_output(
+                        video_metadata.codec_name,
+                        input_audio_codec,
+                        output_path,
+                    )
                 if can_copy_original:
                     audio_profile = audio_utils.copy_or_remux_video_file(input_path, output_path)
                     audio_profile["passthrough_original_video"] = True
-                    if os.path.exists(video_tmp_file_output_path):
-                        os.remove(video_tmp_file_output_path)
-                    if (
-                        working_output_path
-                        and os.path.exists(encoded_output_path)
-                        and os.path.normcase(encoded_output_path) != os.path.normcase(output_path)
-                    ):
-                        os.remove(encoded_output_path)
+                    audio_profile["passthrough_reason"] = passthrough_reason
+                    _cleanup_intermediate_outputs(
+                        video_tmp_file_output_path=video_tmp_file_output_path,
+                        working_output_path=encoded_output_path,
+                        output_path=output_path,
+                    )
                 else:
                     print(
                         _("Preserving original video skipped, falling back to encoded passthrough"),
@@ -302,14 +324,11 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                 os.remove(output_path)
             shutil.move(encoded_output_path, output_path)
     else:
-        if os.path.exists(video_tmp_file_output_path):
-            os.remove(video_tmp_file_output_path)
-        if (
-            working_output_path
-            and os.path.exists(encoded_output_path)
-            and os.path.normcase(encoded_output_path) != os.path.normcase(output_path)
-        ):
-            os.remove(encoded_output_path)
+        _cleanup_intermediate_outputs(
+            video_tmp_file_output_path=video_tmp_file_output_path,
+            working_output_path=encoded_output_path,
+            output_path=output_path,
+        )
 
     report: dict[str, object] = {
         "input_path": input_path,
@@ -372,6 +391,8 @@ def main():
     if compute_target_issue := describe_compute_target_issue(args.device):
         print(compute_target_issue)
         sys.exit(1)
+    if args.fp16 is None:
+        args.fp16 = default_fp16_enabled_for_compute_target(args.device)
 
     with command_profiler.measure("cli_argument_validation_s"):
         if "{orig_file_name}" not in args.output_file_pattern or "." not in args.output_file_pattern:
@@ -563,6 +584,7 @@ def main():
         "timings": command_profiler.snapshot(total_s=command_total_s),
         "compute_target": _compute_target_to_report(compute_target),
         "device": str(device),
+        "fp16": bool(args.fp16),
         "encoder": {
             "name": encoder,
             "options": encoder_options,

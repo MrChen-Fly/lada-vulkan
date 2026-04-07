@@ -109,12 +109,20 @@ function Resolve-LadaCliCommand {
     }
 
     $candidates = @(
+        @((Join-Path $ResolvedProjectRoot ".venv\Scripts\python.exe"), "-m", "lada.cli.main"),
+        @((Join-Path $ResolvedProjectRoot "venv_release_win\Scripts\python.exe"), "-m", "lada.cli.main"),
         (Join-Path $ResolvedProjectRoot ".venv\Scripts\lada-cli.exe"),
         (Join-Path $ResolvedProjectRoot "venv_release_win\Scripts\lada-cli.exe"),
         (Join-Path $ResolvedProjectRoot "dist\lada\lada-cli.exe")
     )
 
     foreach ($candidate in $candidates) {
+        if ($candidate -is [System.Array]) {
+            if (Test-Path -LiteralPath $candidate[0]) {
+                return $candidate
+            }
+            continue
+        }
         if (Test-Path -LiteralPath $candidate) {
             return @($candidate)
         }
@@ -253,6 +261,17 @@ $cliArgs = @(
     "--working-output-extension", ".mp4",
     "--output-file-pattern", "{orig_file_name}.webm"
 )
+
+$explicitFp16Override = $false
+foreach ($arg in $ExtraLadaArgs) {
+    if ($arg -in @("--fp16", "--no-fp16")) {
+        $explicitFp16Override = $true
+        break
+    }
+}
+if ((-not $explicitFp16Override) -and $Device.ToLowerInvariant().StartsWith("vulkan")) {
+    $cliArgs += "--fp16"
+}
 
 if ($ForceBackup) {
     $cliArgs += "--force-backup"
