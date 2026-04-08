@@ -289,10 +289,10 @@ public:
         }
     }
 #else
-    ScopedNativeOpGpuTimestampQuery(NativeOpKind kind, void* cmd = nullptr)
+    template <typename CmdT>
+    ScopedNativeOpGpuTimestampQuery(NativeOpKind kind, CmdT&)
     {
         (void)kind;
-        (void)cmd;
     }
 #endif
 
@@ -309,10 +309,9 @@ inline void finalize_native_op_gpu_profile(ncnn::VkCompute& cmd, const ncnn::Vul
     detail::finalize_command_queries(cmd, vkdev);
 }
 #else
-inline void finalize_native_op_gpu_profile(void* cmd, const void* vkdev)
+template <typename CmdT, typename VkDevT>
+inline void finalize_native_op_gpu_profile(CmdT&, const VkDevT*)
 {
-    (void)cmd;
-    (void)vkdev;
 }
 #endif
 

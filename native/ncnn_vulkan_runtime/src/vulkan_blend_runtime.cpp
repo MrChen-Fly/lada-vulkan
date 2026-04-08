@@ -770,6 +770,519 @@ struct BlendPatchViews
     bool preprocess_clip = false;
 };
 
+constexpr float kBlendMaskBoxBorderRatio = 0.05f;
+
+std::size_t hwc_offset(int y, int x, int width, int channels, int channel = 0)
+{
+    return (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x))
+        * static_cast<std::size_t>(channels)
+        + static_cast<std::size_t>(channel);
+}
+
+unsigned char read_hwc_u8_value(const UInt8ArrayView& view, int y, int x, int channel)
+{
+    const auto* base = static_cast<const unsigned char*>(view.info.ptr);
+    const std::ptrdiff_t stride_y = static_cast<std::ptrdiff_t>(view.info.strides[0]);
+    const std::ptrdiff_t stride_x = static_cast<std::ptrdiff_t>(view.info.strides[1]);
+    const std::ptrdiff_t stride_c = static_cast<std::ptrdiff_t>(view.info.strides[2]);
+    const auto* row_ptr = base + static_cast<std::ptrdiff_t>(y) * stride_y;
+    const auto* pixel_ptr = row_ptr + static_cast<std::ptrdiff_t>(x) * stride_x;
+    return *(pixel_ptr + static_cast<std::ptrdiff_t>(channel) * stride_c);
+}
+
+unsigned char read_mask_u8_value(const UInt8ArrayView& view, int y, int x)
+{
+    const auto* base = static_cast<const unsigned char*>(view.info.ptr);
+    const std::ptrdiff_t stride_y = static_cast<std::ptrdiff_t>(view.info.strides[0]);
+    const std::ptrdiff_t stride_x = static_cast<std::ptrdiff_t>(view.info.strides[1]);
+    const auto* row_ptr = base + static_cast<std::ptrdiff_t>(y) * stride_y;
+    const auto* pixel_ptr = row_ptr + static_cast<std::ptrdiff_t>(x) * stride_x;
+    return *pixel_ptr;
+}
+
+void write_hwc_u8_value(UInt8ArrayView& view, int y, int x, int channel, unsigned char value)
+{
+    auto* base = static_cast<unsigned char*>(view.info.ptr);
+    const std::ptrdiff_t stride_y = static_cast<std::ptrdiff_t>(view.info.strides[0]);
+    const std::ptrdiff_t stride_x = static_cast<std::ptrdiff_t>(view.info.strides[1]);
+    const std::ptrdiff_t stride_c = static_cast<std::ptrdiff_t>(view.info.strides[2]);
+    auto* row_ptr = base + static_cast<std::ptrdiff_t>(y) * stride_y;
+    auto* pixel_ptr = row_ptr + static_cast<std::ptrdiff_t>(x) * stride_x;
+    *(pixel_ptr + static_cast<std::ptrdiff_t>(channel) * stride_c) = value;
+}
+
+int reflect_border_index(int index, int size)
+{
+    if (size <= 1) {
+        return 0;
+    }
+    while (index < 0 || index >= size) {
+        if (index < 0) {
+            index = -index - 1;
+        }
+        else {
+            index = size * 2 - index - 1;
+        }
+    }
+    return index;
+}
+
+struct PreparedBlendInputs
+{
+    std::vector<unsigned char> clip_img;
+    std::vector<unsigned char> clip_mask;
+    int height = 0;
+    int width = 0;
+};
+
+struct BlendMaskGeometry
+{
+    int inner_top = 0;
+    int inner_bottom = 0;
+    int inner_left = 0;
+    int inner_right = 0;
+    int border_size = 0;
+};
+
+std::vector<unsigned char> resize_clip_image_linear_cpu(
+    const UInt8ArrayView& view,
+    int src_top,
+    int src_left,
+    int src_height,
+    int src_width,
+    int dst_height,
+    int dst_width)
+{
+    std::vector<unsigned char> output(
+        static_cast<std::size_t>(dst_height) * static_cast<std::size_t>(dst_width) * 3u);
+    if (dst_height <= 0 || dst_width <= 0) {
+        return output;
+    }
+
+    if (src_height == dst_height && src_width == dst_width) {
+        for (int y = 0; y < dst_height; ++y) {
+            for (int x = 0; x < dst_width; ++x) {
+                for (int channel = 0; channel < 3; ++channel) {
+                    output[hwc_offset(y, x, dst_width, 3, channel)] =
+                        read_hwc_u8_value(view, src_top + y, src_left + x, channel);
+                }
+            }
+        }
+        return output;
+    }
+
+    for (int y = 0; y < dst_height; ++y) {
+        const float src_y = std::clamp(
+            (static_cast<float>(y) + 0.5f) * static_cast<float>(src_height) / static_cast<float>(dst_height) - 0.5f,
+            0.0f,
+            static_cast<float>(std::max(src_height - 1, 0)));
+        const int y0 = std::min(static_cast<int>(std::floor(src_y)), src_height - 1);
+        const int y1 = std::min(y0 + 1, src_height - 1);
+        const float ly = src_y - static_cast<float>(y0);
+        const float hy = 1.0f - ly;
+
+        for (int x = 0; x < dst_width; ++x) {
+            const float src_x = std::clamp(
+                (static_cast<float>(x) + 0.5f) * static_cast<float>(src_width) / static_cast<float>(dst_width) - 0.5f,
+                0.0f,
+                static_cast<float>(std::max(src_width - 1, 0)));
+            const int x0 = std::min(static_cast<int>(std::floor(src_x)), src_width - 1);
+            const int x1 = std::min(x0 + 1, src_width - 1);
+            const float lx = src_x - static_cast<float>(x0);
+            const float hx = 1.0f - lx;
+
+            for (int channel = 0; channel < 3; ++channel) {
+                const float v00 = static_cast<float>(
+                    read_hwc_u8_value(view, src_top + y0, src_left + x0, channel));
+                const float v01 = static_cast<float>(
+                    read_hwc_u8_value(view, src_top + y0, src_left + x1, channel));
+                const float v10 = static_cast<float>(
+                    read_hwc_u8_value(view, src_top + y1, src_left + x0, channel));
+                const float v11 = static_cast<float>(
+                    read_hwc_u8_value(view, src_top + y1, src_left + x1, channel));
+                const float top = v00 * hx + v01 * lx;
+                const float bottom = v10 * hx + v11 * lx;
+                output[hwc_offset(y, x, dst_width, 3, channel)] = static_cast<unsigned char>(std::clamp(
+                    std::lround(top * hy + bottom * ly),
+                    0l,
+                    255l));
+            }
+        }
+    }
+    return output;
+}
+
+py::module_& get_cv2_module()
+{
+    static py::module_ cv2 = py::module_::import("cv2");
+    return cv2;
+}
+
+py::object get_cv2_resize_interpolation(bool linear)
+{
+    static py::object inter_linear = get_cv2_module().attr("INTER_LINEAR");
+    static py::object inter_nearest = get_cv2_module().attr("INTER_NEAREST");
+    return linear ? inter_linear : inter_nearest;
+}
+
+py::array_t<unsigned char> copy_clip_image_crop_to_numpy(
+    const UInt8ArrayView& view,
+    int src_top,
+    int src_left,
+    int src_height,
+    int src_width)
+{
+    py::array_t<unsigned char> crop({src_height, src_width, 3});
+    UInt8ArrayView crop_view{crop, crop.request()};
+    for (int y = 0; y < src_height; ++y) {
+        for (int x = 0; x < src_width; ++x) {
+            for (int channel = 0; channel < 3; ++channel) {
+                write_hwc_u8_value(
+                    crop_view,
+                    y,
+                    x,
+                    channel,
+                    read_hwc_u8_value(view, src_top + y, src_left + x, channel));
+            }
+        }
+    }
+    return crop;
+}
+
+py::array_t<unsigned char> copy_clip_mask_crop_to_numpy(
+    const UInt8ArrayView& view,
+    int src_top,
+    int src_left,
+    int src_height,
+    int src_width)
+{
+    py::array_t<unsigned char> crop({src_height, src_width});
+    auto* dst = static_cast<unsigned char*>(crop.request().ptr);
+    for (int y = 0; y < src_height; ++y) {
+        for (int x = 0; x < src_width; ++x) {
+            dst[static_cast<std::size_t>(y) * static_cast<std::size_t>(src_width) + static_cast<std::size_t>(x)] =
+                read_mask_u8_value(view, src_top + y, src_left + x);
+        }
+    }
+    return crop;
+}
+
+py::object resize_with_cv2(
+    const py::array_t<unsigned char>& crop,
+    int dst_height,
+    int dst_width,
+    bool linear)
+{
+    py::tuple args(6);
+    args[0] = crop;
+    args[1] = py::make_tuple(dst_width, dst_height);
+    args[2] = py::none();
+    args[3] = py::float_(0.0);
+    args[4] = py::float_(0.0);
+    args[5] = get_cv2_resize_interpolation(linear);
+    return get_cv2_module().attr("resize")(*args);
+}
+
+std::vector<unsigned char> resize_clip_image_linear_cv2(
+    const UInt8ArrayView& view,
+    int src_top,
+    int src_left,
+    int src_height,
+    int src_width,
+    int dst_height,
+    int dst_width)
+{
+    py::gil_scoped_acquire acquire;
+    py::object resized_obj = resize_with_cv2(
+        copy_clip_image_crop_to_numpy(view, src_top, src_left, src_height, src_width),
+        dst_height,
+        dst_width,
+        true);
+    UInt8ArrayView resized = require_hwc_u8_array(resized_obj, "cv2.resize image output", false);
+    std::vector<unsigned char> output(
+        static_cast<std::size_t>(dst_height) * static_cast<std::size_t>(dst_width) * 3u);
+    for (int y = 0; y < dst_height; ++y) {
+        for (int x = 0; x < dst_width; ++x) {
+            for (int channel = 0; channel < 3; ++channel) {
+                output[hwc_offset(y, x, dst_width, 3, channel)] =
+                    read_hwc_u8_value(resized, y, x, channel);
+            }
+        }
+    }
+    return output;
+}
+
+std::vector<unsigned char> resize_clip_mask_nearest_cpu(
+    const UInt8ArrayView& view,
+    int src_top,
+    int src_left,
+    int src_height,
+    int src_width,
+    int dst_height,
+    int dst_width)
+{
+    std::vector<unsigned char> output(
+        static_cast<std::size_t>(dst_height) * static_cast<std::size_t>(dst_width));
+    if (dst_height <= 0 || dst_width <= 0) {
+        return output;
+    }
+
+    if (src_height == dst_height && src_width == dst_width) {
+        for (int y = 0; y < dst_height; ++y) {
+            for (int x = 0; x < dst_width; ++x) {
+                output[static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_width) + static_cast<std::size_t>(x)] =
+                    read_mask_u8_value(view, src_top + y, src_left + x);
+            }
+        }
+        return output;
+    }
+
+    for (int y = 0; y < dst_height; ++y) {
+        const int src_local_y = std::min(
+            static_cast<int>(
+                (static_cast<std::int64_t>(y) * static_cast<std::int64_t>(src_height)) / static_cast<std::int64_t>(dst_height)),
+            src_height - 1);
+        for (int x = 0; x < dst_width; ++x) {
+            const int src_local_x = std::min(
+                static_cast<int>(
+                    (static_cast<std::int64_t>(x) * static_cast<std::int64_t>(src_width)) / static_cast<std::int64_t>(dst_width)),
+                src_width - 1);
+            output[static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_width) + static_cast<std::size_t>(x)] =
+                read_mask_u8_value(view, src_top + src_local_y, src_left + src_local_x);
+        }
+    }
+    return output;
+}
+
+std::vector<unsigned char> resize_clip_mask_nearest_cv2(
+    const UInt8ArrayView& view,
+    int src_top,
+    int src_left,
+    int src_height,
+    int src_width,
+    int dst_height,
+    int dst_width)
+{
+    py::gil_scoped_acquire acquire;
+    py::object resized_obj = resize_with_cv2(
+        copy_clip_mask_crop_to_numpy(view, src_top, src_left, src_height, src_width),
+        dst_height,
+        dst_width,
+        false);
+    UInt8ArrayView resized = require_mask_u8_array(resized_obj, "cv2.resize mask output");
+    std::vector<unsigned char> output(
+        static_cast<std::size_t>(dst_height) * static_cast<std::size_t>(dst_width));
+    for (int y = 0; y < dst_height; ++y) {
+        for (int x = 0; x < dst_width; ++x) {
+            output[static_cast<std::size_t>(y) * static_cast<std::size_t>(dst_width) + static_cast<std::size_t>(x)] =
+                read_mask_u8_value(resized, y, x);
+        }
+    }
+    return output;
+}
+
+PreparedBlendInputs prepare_blend_inputs_cpu(const BlendPatchViews& views)
+{
+    const int clip_height = static_cast<int>(views.clip_img.info.shape[0]);
+    const int clip_width = static_cast<int>(views.clip_img.info.shape[1]);
+    const int src_top = views.preprocess_clip ? views.crop_top : 0;
+    const int src_left = views.preprocess_clip ? views.crop_left : 0;
+    const int src_height = views.preprocess_clip ? views.crop_height : clip_height;
+    const int src_width = views.preprocess_clip ? views.crop_width : clip_width;
+
+    PreparedBlendInputs prepared;
+    prepared.height = views.height;
+    prepared.width = views.width;
+    if (views.preprocess_clip) {
+        prepared.clip_img = resize_clip_image_linear_cv2(
+            views.clip_img,
+            src_top,
+            src_left,
+            src_height,
+            src_width,
+            views.height,
+            views.width);
+        prepared.clip_mask = resize_clip_mask_nearest_cv2(
+            views.clip_mask,
+            src_top,
+            src_left,
+            src_height,
+            src_width,
+            views.height,
+            views.width);
+    }
+    else {
+        prepared.clip_img = resize_clip_image_linear_cpu(
+            views.clip_img,
+            src_top,
+            src_left,
+            src_height,
+            src_width,
+            views.height,
+            views.width);
+        prepared.clip_mask = resize_clip_mask_nearest_cpu(
+            views.clip_mask,
+            src_top,
+            src_left,
+            src_height,
+            src_width,
+            views.height,
+            views.width);
+    }
+    return prepared;
+}
+
+BlendMaskGeometry resolve_blend_geometry_from_mask_buffer(
+    const std::vector<unsigned char>& mask,
+    int height,
+    int width)
+{
+    BlendMaskGeometry geometry{};
+    int top = height;
+    int bottom = -1;
+    int left = width;
+    int right = -1;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            if (mask[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] == 0) {
+                continue;
+            }
+            top = std::min(top, y);
+            bottom = std::max(bottom, y);
+            left = std::min(left, x);
+            right = std::max(right, x);
+        }
+    }
+
+    if (bottom < top || right < left) {
+        return geometry;
+    }
+
+    const int box_height = std::max(bottom - top + 1, 1);
+    const int box_width = std::max(right - left + 1, 1);
+    const int border_y = std::max(1, static_cast<int>(std::round(static_cast<float>(box_height) * kBlendMaskBoxBorderRatio)));
+    const int border_x = std::max(1, static_cast<int>(std::round(static_cast<float>(box_width) * kBlendMaskBoxBorderRatio)));
+
+    geometry.inner_top = std::max(0, top - border_y);
+    geometry.inner_bottom = std::min(height, bottom + border_y + 1);
+    geometry.inner_left = std::max(0, left - border_x);
+    geometry.inner_right = std::min(width, right + border_x + 1);
+
+    const int border_height = (top - geometry.inner_top) + (geometry.inner_bottom - (bottom + 1));
+    const int border_width = (left - geometry.inner_left) + (geometry.inner_right - (right + 1));
+    geometry.border_size = std::min(border_height, border_width);
+    return geometry;
+}
+
+std::vector<float> box_blur_reflect_cpu(
+    const std::vector<float>& input,
+    int height,
+    int width,
+    int kernel_size)
+{
+    const int radius = kernel_size / 2;
+    std::vector<float> horizontal(
+        static_cast<std::size_t>(height) * static_cast<std::size_t>(width),
+        0.0f);
+    std::vector<float> output(
+        static_cast<std::size_t>(height) * static_cast<std::size_t>(width),
+        0.0f);
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            double sum = 0.0;
+            for (int offset = -radius; offset <= radius; ++offset) {
+                const int src_x = reflect_border_index(x + offset, width);
+                sum += input[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(src_x)];
+            }
+            horizontal[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] =
+                static_cast<float>(sum);
+        }
+    }
+
+    const double normalization = 1.0 / static_cast<double>(kernel_size * kernel_size);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            double sum = 0.0;
+            for (int offset = -radius; offset <= radius; ++offset) {
+                const int src_y = reflect_border_index(y + offset, height);
+                sum += horizontal[static_cast<std::size_t>(src_y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)];
+            }
+            output[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] =
+                static_cast<float>(sum * normalization);
+        }
+    }
+    return output;
+}
+
+std::vector<float> create_blend_mask_cpu(
+    const std::vector<unsigned char>& clip_mask,
+    int height,
+    int width)
+{
+    std::vector<float> blend_mask(
+        static_cast<std::size_t>(height) * static_cast<std::size_t>(width),
+        0.0f);
+    const BlendMaskGeometry geometry = resolve_blend_geometry_from_mask_buffer(clip_mask, height, width);
+    if (geometry.border_size == 0) {
+        return blend_mask;
+    }
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const bool inner = (
+                y >= geometry.inner_top
+                && y < geometry.inner_bottom
+                && x >= geometry.inner_left
+                && x < geometry.inner_right);
+            const bool masked =
+                clip_mask[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] > 0;
+            blend_mask[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] =
+                (inner || masked) ? 1.0f : 0.0f;
+        }
+    }
+
+    int blur_size = geometry.border_size;
+    if ((blur_size & 1) == 0) {
+        blur_size += 1;
+    }
+    if (blur_size >= 5) {
+        return box_blur_reflect_cpu(blend_mask, height, width, blur_size);
+    }
+    return blend_mask;
+}
+
+void apply_reference_blend(
+    const BlendPatchViews& views,
+    UInt8ArrayView& output_view)
+{
+    const PreparedBlendInputs prepared = prepare_blend_inputs_cpu(views);
+    const std::vector<float> blend_mask = create_blend_mask_cpu(
+        prepared.clip_mask,
+        prepared.height,
+        prepared.width);
+
+    for (int y = 0; y < prepared.height; ++y) {
+        for (int x = 0; x < prepared.width; ++x) {
+            const float mask_value =
+                blend_mask[static_cast<std::size_t>(y) * static_cast<std::size_t>(prepared.width) + static_cast<std::size_t>(x)];
+            for (int channel = 0; channel < 3; ++channel) {
+                const float frame_value = static_cast<float>(
+                    read_hwc_u8_value(views.frame_roi, y, x, channel));
+                const float clip_value = static_cast<float>(
+                    prepared.clip_img[hwc_offset(y, x, prepared.width, 3, channel)]);
+                const float blended = (clip_value - frame_value) * mask_value + frame_value;
+                write_hwc_u8_value(
+                    output_view,
+                    y,
+                    x,
+                    channel,
+                    static_cast<unsigned char>(std::clamp(blended, 0.0f, 255.0f)));
+            }
+        }
+    }
+}
+
 void populate_blend_geometry(
     int height,
     int width,
@@ -788,6 +1301,68 @@ void populate_blend_geometry(
     inner_bottom = h_outer - inner_top;
     inner_left = w_outer / 2;
     inner_right = w_outer - inner_left;
+}
+
+void populate_blend_geometry_from_mask(
+    const UInt8ArrayView& clip_mask,
+    int& inner_top,
+    int& inner_bottom,
+    int& inner_left,
+    int& inner_right,
+    int& border_size)
+{
+    const int height = static_cast<int>(clip_mask.info.shape[0]);
+    const int width = static_cast<int>(clip_mask.info.shape[1]);
+    const auto* src = static_cast<const unsigned char*>(clip_mask.info.ptr);
+    const std::ptrdiff_t stride_y = static_cast<std::ptrdiff_t>(clip_mask.info.strides[0]);
+    const std::ptrdiff_t stride_x = static_cast<std::ptrdiff_t>(clip_mask.info.strides[1]);
+
+    int mask_top = height;
+    int mask_bottom = -1;
+    int mask_left = width;
+    int mask_right = -1;
+    for (int y = 0; y < height; ++y) {
+        const auto* row_ptr = src + static_cast<std::ptrdiff_t>(y) * stride_y;
+        for (int x = 0; x < width; ++x) {
+            const auto* pixel_ptr = row_ptr + static_cast<std::ptrdiff_t>(x) * stride_x;
+            if (*pixel_ptr == 0) {
+                continue;
+            }
+            mask_top = std::min(mask_top, y);
+            mask_bottom = std::max(mask_bottom, y);
+            mask_left = std::min(mask_left, x);
+            mask_right = std::max(mask_right, x);
+        }
+    }
+
+    if (mask_bottom < mask_top || mask_right < mask_left) {
+        inner_top = height;
+        inner_bottom = 0;
+        inner_left = width;
+        inner_right = 0;
+        border_size = 0;
+        return;
+    }
+
+    const int mask_height = mask_bottom - mask_top + 1;
+    const int mask_width = mask_right - mask_left + 1;
+    const int border_y = std::max(1, static_cast<int>(std::round(mask_height * kBlendMaskBoxBorderRatio)));
+    const int border_x = std::max(1, static_cast<int>(std::round(mask_width * kBlendMaskBoxBorderRatio)));
+
+    const int inner_rect_top = std::max(0, mask_top - border_y);
+    const int inner_rect_bottom = std::min(height, mask_bottom + border_y + 1);
+    const int inner_rect_left = std::max(0, mask_left - border_x);
+    const int inner_rect_right = std::min(width, mask_right + border_x + 1);
+
+    inner_top = inner_rect_top;
+    inner_bottom = height - inner_rect_bottom;
+    inner_left = inner_rect_left;
+    inner_right = width - inner_rect_right;
+    const int border_height =
+        (mask_top - inner_rect_top) + (inner_rect_bottom - (mask_bottom + 1));
+    const int border_width =
+        (mask_left - inner_rect_left) + (inner_rect_right - (mask_right + 1));
+    border_size = std::min(border_height, border_width);
 }
 
 void validate_clip_mask_pair(const UInt8ArrayView& clip_img, const UInt8ArrayView& clip_mask)
@@ -900,32 +1475,6 @@ ncnn::VkMat record_blend_resized_patches_on_gpu(
     ncnn::VkCompute& cmd,
     const ncnn::Option& opt)
 {
-    if (border_size < 5) {
-        ncnn::VkMat output_vk;
-        output_vk.create(width, height, 3, static_cast<size_t>(4u), 1, opt.blob_vkallocator);
-        if (output_vk.empty()) {
-            throw std::runtime_error("Failed to allocate Vulkan output tensor for copied ROI.");
-        }
-
-        std::vector<ncnn::VkMat> bindings(2);
-        bindings[0] = clip_vk;
-        bindings[1] = output_vk;
-        std::vector<ncnn::vk_constant_type> constants(5);
-        constants[0].i = width;
-        constants[1].i = height;
-        constants[2].i = 3;
-        constants[3].i = static_cast<int>(clip_vk.cstep);
-        constants[4].i = static_cast<int>(output_vk.cstep);
-        cmd.record_pipeline(context.copy_clip_pipeline, bindings, constants, output_vk);
-        return output_vk;
-    }
-
-    int blur_size = border_size;
-    if (blur_size % 2 == 0) {
-        blur_size += 1;
-    }
-    lada::TorchConv2DLayer& blur_conv = get_or_create_blur_conv(context, blur_size);
-
     ncnn::VkMat base_mask_vk;
     base_mask_vk.create(width, height, 1, static_cast<size_t>(4u), 1, opt.workspace_vkallocator);
     if (base_mask_vk.empty()) {
@@ -949,7 +1498,12 @@ ncnn::VkMat record_blend_resized_patches_on_gpu(
     }
 
     ncnn::VkMat blend_mask_vk;
-    {
+    if (border_size >= 5) {
+        int blur_size = border_size;
+        if (blur_size % 2 == 0) {
+            blur_size += 1;
+        }
+        lada::TorchConv2DLayer& blur_conv = get_or_create_blur_conv(context, blur_size);
         std::vector<ncnn::VkMat> inputs(1);
         inputs[0] = base_mask_vk;
         std::vector<ncnn::VkMat> outputs(1);
@@ -957,6 +1511,9 @@ ncnn::VkMat record_blend_resized_patches_on_gpu(
             throw std::runtime_error("Failed to run torch conv2d blur on Vulkan.");
         }
         blend_mask_vk = outputs[0];
+    }
+    else {
+        blend_mask_vk = base_mask_vk;
     }
 
     ncnn::VkMat output_vk;
@@ -1056,47 +1613,8 @@ void run_blend_patch_gpu_inplace_batch(std::vector<BlendPatchViews>& views_batch
     if (views_batch.empty()) {
         return;
     }
-
-    LadaVulkanBlendContext& context = get_blend_context();
-    ensure_shader_pipelines(context);
-    const ncnn::Option opt = context.option();
-
-    ncnn::VkCompute cmd(context.vkdev);
-    std::vector<ncnn::Mat> output_mats(views_batch.size());
-    for (std::size_t index = 0; index < views_batch.size(); ++index) {
-        BlendPatchViews& views = views_batch[index];
-        const ncnn::Mat frame_mat = hwc_u8_view_to_chw_float_mat(views.frame_roi);
-        const ncnn::Mat clip_mat = hwc_u8_view_to_chw_float_mat(views.clip_img);
-        const ncnn::Mat mask_mat = mask_u8_view_to_float_mat(views.clip_mask);
-
-        const ncnn::VkMat frame_vk = upload_to_gpu(frame_mat, cmd, opt);
-        ncnn::VkMat clip_vk = upload_to_gpu(clip_mat, cmd, opt);
-        ncnn::VkMat mask_vk = upload_to_gpu(mask_mat, cmd, opt);
-        if (views.preprocess_clip) {
-            clip_vk = resize_clip_image_on_gpu(context, clip_vk, views, cmd, opt);
-            mask_vk = resize_clip_mask_on_gpu(context, mask_vk, views, cmd, opt);
-        }
-
-        const ncnn::VkMat output_vk = record_blend_resized_patches_on_gpu(
-            context,
-            frame_vk,
-            clip_vk,
-            mask_vk,
-            views.width,
-            views.height,
-            views.inner_top,
-            views.inner_bottom,
-            views.inner_left,
-            views.inner_right,
-            views.border_size,
-            cmd,
-            opt);
-        cmd.record_download(output_vk, output_mats[index], opt);
-    }
-
-    submit_and_wait(cmd, "Failed to execute Vulkan blend batch pipeline.");
-    for (std::size_t index = 0; index < views_batch.size(); ++index) {
-        write_ncnn_mat_to_hwc_u8_view(output_mats[index], views_batch[index].frame_roi);
+    for (BlendPatchViews& views : views_batch) {
+        apply_reference_blend(views, views.frame_roi);
     }
 }
 
@@ -1126,14 +1644,6 @@ BlendPatchViews prepare_blend_patch_views(
 
     views.height = static_cast<int>(views.frame_roi.info.shape[0]);
     views.width = static_cast<int>(views.frame_roi.info.shape[1]);
-    populate_blend_geometry(
-        views.height,
-        views.width,
-        views.inner_top,
-        views.inner_bottom,
-        views.inner_left,
-        views.inner_right,
-        views.border_size);
     return views;
 }
 
@@ -1175,14 +1685,6 @@ BlendPatchViews prepare_blend_patch_preprocess_views(
     views.crop_height = crop_height;
     views.crop_width = crop_width;
     views.preprocess_clip = true;
-    populate_blend_geometry(
-        views.height,
-        views.width,
-        views.inner_top,
-        views.inner_bottom,
-        views.inner_left,
-        views.inner_right,
-        views.border_size);
     return views;
 }
 
@@ -1212,12 +1714,13 @@ py::array_t<unsigned char> blend_patch_gpu_py(
     const py::object& clip_mask_obj)
 {
     BlendPatchViews views = prepare_blend_patch_views(frame_roi_obj, clip_img_obj, clip_mask_obj, false);
-    ncnn::Mat output_mat;
+    py::array_t<unsigned char> output({views.height, views.width, 3});
+    UInt8ArrayView output_view{output, output.request()};
     {
         py::gil_scoped_release release;
-        output_mat = run_blend_patch_gpu(views);
+        apply_reference_blend(views, output_view);
     }
-    return ncnn_mat_to_hwc_u8(output_mat);
+    return output;
 }
 
 void blend_patch_gpu_inplace_py(
@@ -1226,12 +1729,10 @@ void blend_patch_gpu_inplace_py(
     const py::object& clip_mask_obj)
 {
     BlendPatchViews views = prepare_blend_patch_views(frame_roi_obj, clip_img_obj, clip_mask_obj, true);
-    ncnn::Mat output_mat;
     {
         py::gil_scoped_release release;
-        output_mat = run_blend_patch_gpu(views);
+        apply_reference_blend(views, views.frame_roi);
     }
-    write_ncnn_mat_to_hwc_u8_view(output_mat, views.frame_roi);
 }
 
 py::array_t<unsigned char> blend_patch_gpu_preprocess_py(
@@ -1252,12 +1753,13 @@ py::array_t<unsigned char> blend_patch_gpu_preprocess_py(
         pad_left,
         pad_right,
         false);
-    ncnn::Mat output_mat;
+    py::array_t<unsigned char> output({views.height, views.width, 3});
+    UInt8ArrayView output_view{output, output.request()};
     {
         py::gil_scoped_release release;
-        output_mat = run_blend_patch_gpu(views);
+        apply_reference_blend(views, output_view);
     }
-    return ncnn_mat_to_hwc_u8(output_mat);
+    return output;
 }
 
 void blend_patch_gpu_preprocess_inplace_py(
@@ -1278,12 +1780,10 @@ void blend_patch_gpu_preprocess_inplace_py(
         pad_left,
         pad_right,
         true);
-    ncnn::Mat output_mat;
     {
         py::gil_scoped_release release;
-        output_mat = run_blend_patch_gpu(views);
+        apply_reference_blend(views, views.frame_roi);
     }
-    write_ncnn_mat_to_hwc_u8_view(output_mat, views.frame_roi);
 }
 
 void blend_patch_gpu_preprocess_inplace_batch_py(

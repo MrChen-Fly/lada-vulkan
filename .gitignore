@@ -16,6 +16,7 @@ build_gtk/
 build_gtk_release/
 native/ncnn_vulkan_runtime/build/
 torch_compile_debug/
+scripts/windows/restore_soa_pic_webm_state.json
 __pycache__/
 resources/
 *.fp16_ncnn_model/

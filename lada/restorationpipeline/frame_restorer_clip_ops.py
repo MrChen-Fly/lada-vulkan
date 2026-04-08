@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from lada.utils import Image, ImageTensor
@@ -18,6 +19,13 @@ from .clip_units import (
 
 if TYPE_CHECKING:
     from .frame_restorer import FrameRestorer
+
+
+def _snapshot_restored_frame(frame: Image | ImageTensor) -> Image | ImageTensor:
+    """Detach restored frame storage from reusable runtime buffers."""
+    if isinstance(frame, torch.Tensor):
+        return frame.clone()
+    return np.ascontiguousarray(frame).copy()
 
 
 def restore_clip_frames(
@@ -39,7 +47,7 @@ def restore_clip(restorer: "FrameRestorer", clip: Clip) -> None:
 
     for index, restored_frame in enumerate(restored_clip_images):
         assert clip.frames[index].shape == restored_frame.shape
-        clip.frames[index] = restored_frame
+        clip.frames[index] = _snapshot_restored_frame(restored_frame)
 
 
 def materialize_clip_work_item(
@@ -107,6 +115,7 @@ def restore_descriptor_work_item(
             resize_reference_shape=clip.resize_reference_shape,
             pad_mode=clip.pad_mode,
         )
+    restored_frames = [_snapshot_restored_frame(frame) for frame in restored_frames]
     return Clip.from_processed_data(
         file_path=clip.file_path,
         frame_start=clip.frame_start,

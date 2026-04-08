@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 import csv
 import dataclasses
+import hashlib
 import io
 import json
 import logging
@@ -198,6 +199,15 @@ def get_video_meta_data(path: str) -> VideoMetadata:
 
 def offset_ns_to_frame_num(offset_ns, video_fps_exact):
     return int(Fraction(offset_ns, 1_000_000_000) * video_fps_exact)
+
+
+def build_temp_video_output_path(temp_dir: str, output_path: str) -> str:
+    """Build a stable temp video path that stays unique per final output path."""
+    normalized_output_path = os.path.abspath(output_path)
+    output_root, output_ext = os.path.splitext(normalized_output_path)
+    output_stem = os.path.basename(output_root) or "video"
+    path_digest = hashlib.sha1(normalized_output_path.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(temp_dir, f"{output_stem}.{path_digest}.tmp{output_ext}")
 
 def write_frames_to_video_file(frames: list[Image], output_path, fps: int | float | Fraction, codec='x264', preset='medium', crf=None):
     assert frames[0].ndim == 3

@@ -217,7 +217,10 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
     frame_restorer_profile: dict[str, object] = {}
     video_writer: VideoWriter | None = None
     error_message: str | None = None
-    video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(encoded_output_path)[0])}.tmp{os.path.splitext(encoded_output_path)[1]}")
+    video_tmp_file_output_path = video_utils.build_temp_video_output_path(
+        temp_dir_path,
+        encoded_output_path,
+    )
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
     if working_output_path:
         pathlib.Path(encoded_output_path).parent.mkdir(exist_ok=True, parents=True)
@@ -320,6 +323,13 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
             encoded_output_path != output_path
             and os.path.exists(encoded_output_path)
         ):
+            encoded_output_extension = os.path.splitext(encoded_output_path)[1].lower()
+            final_output_extension = os.path.splitext(output_path)[1].lower()
+            if encoded_output_extension != final_output_extension:
+                raise RuntimeError(
+                    "Refusing to rename a staged output with a different container extension: "
+                    f"'{encoded_output_path}' -> '{output_path}'"
+                )
             if os.path.exists(output_path):
                 os.remove(output_path)
             shutil.move(encoded_output_path, output_path)

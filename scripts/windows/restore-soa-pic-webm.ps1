@@ -28,9 +28,7 @@ function Get-DefaultProjectRoot {
 }
 
 function Get-DefaultStatePath {
-    param([Parameter(Mandatory)] [string]$ResolvedProjectRoot)
-
-    return (Join-Path $ResolvedProjectRoot ".helloagents\tmp\restore_soa_pic_webm_state.json")
+    return (Join-Path $PSScriptRoot "restore_soa_pic_webm_state.json")
 }
 
 function Get-FullPath {
@@ -98,6 +96,53 @@ function Test-BackupFileReady {
     )
 }
 
+function Test-WebmContainerSignature {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $header = New-Object byte[] 4
+        $bytesRead = $stream.Read($header, 0, $header.Length)
+        return (
+            $bytesRead -eq 4 -and
+            $header[0] -eq 0x1A -and
+            $header[1] -eq 0x45 -and
+            $header[2] -eq 0xDF -and
+            $header[3] -eq 0xA3
+        )
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Test-OutputFileReady {
+    param([Parameter(Mandatory)] [string]$OutputPath)
+
+    if (-not (Test-Path -LiteralPath $OutputPath)) {
+        return $false
+    }
+
+    $outputExtension = [System.IO.Path]::GetExtension($OutputPath).ToLowerInvariant()
+    if ($outputExtension -eq ".webm") {
+        return (Test-WebmContainerSignature -Path $OutputPath)
+    }
+
+    return $true
+}
+
+function Get-DefaultWebmEncodingArgs {
+    # Use a WebM-compatible encoder by default so the final ".webm" output is
+    # a real WebM container instead of a renamed MP4 file.
+    return @("--encoding-preset", "av1-cpu-uhq")
+}
+
 function Resolve-LadaCliCommand {
     param(
         [Parameter(Mandatory)] [string]$ResolvedProjectRoot,
@@ -141,6 +186,159 @@ function Resolve-LadaCliCommand {
     throw "Unable to resolve a lada CLI command. Pass -LadaCommand explicitly."
 }
 
+function Stop-ProcessTree {
+    param(
+        [Parameter(Mandatory)] [int]$ProcessId,
+        [switch]$IncludeRoot = $true
+    )
+
+    if ($ProcessId -le 0) {
+        return
+    }
+
+    $descendantIds = @()
+    $pendingParents = [System.Collections.Generic.Queue[int]]::new()
+    $pendingParents.Enqueue($ProcessId)
+    while ($pendingParents.Count -gt 0) {
+        $parentId = $pendingParents.Dequeue()
+        $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $parentId" -ErrorAction SilentlyContinue)
+        foreach ($child in $children) {
+            $childId = [int]$child.ProcessId
+            if ($childId -le 0 -or $descendantIds -contains $childId) {
+                continue
+            }
+            $descendantIds += $childId
+            $pendingParents.Enqueue($childId)
+        }
+    }
+
+    $taskKill = Get-Command "taskkill.exe" -ErrorAction SilentlyContinue
+    $rootProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($IncludeRoot -and $null -ne $taskKill -and $null -ne $rootProcess) {
+        & $taskKill.Source /PID $ProcessId /T /F *> $null
+    }
+    elseif ($IncludeRoot -and $null -ne $rootProcess) {
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    foreach ($childId in ($descendantIds | Sort-Object -Descending)) {
+        Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function ConvertTo-ProcessArguments {
+    param([Parameter(Mandatory)] [string[]]$Arguments)
+
+    $escapedArguments = foreach ($argument in $Arguments) {
+        $value = [string]$argument
+        if ($value.Length -eq 0) {
+            '""'
+            continue
+        }
+        if ($value -notmatch '[\s"]') {
+            $value
+            continue
+        }
+
+        $quotedValue = $value -replace '(\\*)"', '$1$1\"'
+        $quotedValue = $quotedValue -replace '(\\+)$', '$1$1'
+        '"' + $quotedValue + '"'
+    }
+
+    return [string]::Join(' ', $escapedArguments)
+}
+
+function Start-ConsoleCancelMonitor {
+    $monitorState = @{
+        TreatCtrlCAsInputEnabled = $false
+        OriginalTreatCtrlCAsInput = $false
+        CancelEventInfo = $null
+        CancelHandler = $null
+    }
+
+    try {
+        $monitorState.OriginalTreatCtrlCAsInput = [System.Console]::TreatControlCAsInput
+        [System.Console]::TreatControlCAsInput = $true
+        $monitorState.TreatCtrlCAsInputEnabled = $true
+    }
+    catch {
+        # Some non-interactive hosts do not expose a readable console input
+        # buffer. In that case we keep the legacy cancel event fallback only.
+    }
+
+    $monitorState.CancelHandler = [System.ConsoleCancelEventHandler]{
+        param($sender, $eventArgs)
+
+        $eventArgs.Cancel = $true
+        Request-LadaBatchCancellation
+    }
+    $monitorState.CancelEventInfo = [System.Console].GetEvent("CancelKeyPress")
+    $monitorState.CancelEventInfo.AddEventHandler($null, $monitorState.CancelHandler)
+
+    return $monitorState
+}
+
+function Test-ConsoleCancelRequested {
+    param([Parameter(Mandatory)] [hashtable]$MonitorState)
+
+    if (-not $MonitorState.TreatCtrlCAsInputEnabled) {
+        return $false
+    }
+
+    try {
+        while ([System.Console]::KeyAvailable) {
+            $keyInfo = [System.Console]::ReadKey($true)
+            $isCtrlC = (
+                $keyInfo.Key -eq [System.ConsoleKey]::C -and
+                (($keyInfo.Modifiers -band [System.ConsoleModifiers]::Control) -ne 0)
+            )
+            if ($isCtrlC) {
+                return $true
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+
+    return $false
+}
+
+function Stop-ConsoleCancelMonitor {
+    param([hashtable]$MonitorState)
+
+    if ($null -eq $MonitorState) {
+        return
+    }
+
+    if (($null -ne $MonitorState.CancelEventInfo) -and ($null -ne $MonitorState.CancelHandler)) {
+        $MonitorState.CancelEventInfo.RemoveEventHandler($null, $MonitorState.CancelHandler)
+    }
+
+    if ($MonitorState.TreatCtrlCAsInputEnabled) {
+        try {
+            [System.Console]::TreatControlCAsInput = [bool]$MonitorState.OriginalTreatCtrlCAsInput
+        }
+        catch {
+        }
+    }
+}
+
+function Request-LadaBatchCancellation {
+    if (-not $script:RestoreSoaPicWebmCancelled) {
+        $script:RestoreSoaPicWebmCancelled = $true
+    }
+
+    if (-not $script:RestoreSoaPicWebmCancellationNoticeShown) {
+        $script:RestoreSoaPicWebmCancellationNoticeShown = $true
+        Write-Warning "Ctrl+C received, stopping lada-cli..."
+    }
+
+    if ($script:RestoreSoaPicWebmProcessId -gt 0) {
+        Stop-ProcessTree -ProcessId $script:RestoreSoaPicWebmProcessId
+    }
+}
+
 function Invoke-LadaCliBatch {
     param(
         [Parameter(Mandatory)] [string[]]$Command,
@@ -149,19 +347,85 @@ function Invoke-LadaCliBatch {
     )
 
     Push-Location $WorkingDirectory
+    $ladaProcess = $null
+    $ladaExitCode = 0
+    $cancelRequested = $false
+    $cancelMonitor = $null
+    $hadSvtLog = Test-Path Env:SVT_LOG
+    $originalSvtLog = if ($hadSvtLog) { $env:SVT_LOG } else { $null }
+    $script:RestoreSoaPicWebmCancelled = $false
+    $script:RestoreSoaPicWebmProcessId = 0
+    $script:RestoreSoaPicWebmCancellationNoticeShown = $false
     try {
         $commandArgs = @()
         if ($Command.Count -gt 1) {
             $commandArgs = $Command[1..($Command.Count - 1)]
         }
-        & $Command[0] @($commandArgs + $Arguments)
-        if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
+
+        $processArguments = ConvertTo-ProcessArguments -Arguments @($commandArgs + $Arguments)
+        if (-not $hadSvtLog) {
+            $env:SVT_LOG = "0"
         }
+
+        $cancelMonitor = Start-ConsoleCancelMonitor
+
+        $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processStartInfo.FileName = $Command[0]
+        $processStartInfo.Arguments = $processArguments
+        $processStartInfo.WorkingDirectory = $WorkingDirectory
+        $processStartInfo.UseShellExecute = $false
+        $processStartInfo.RedirectStandardOutput = $false
+        $processStartInfo.RedirectStandardError = $false
+        $processStartInfo.CreateNoWindow = $false
+
+        $ladaProcess = New-Object System.Diagnostics.Process
+        $ladaProcess.StartInfo = $processStartInfo
+        $null = $ladaProcess.Start()
+        $script:RestoreSoaPicWebmProcessId = $ladaProcess.Id
+
+        while (-not $ladaProcess.WaitForExit(200)) {
+            if (Test-ConsoleCancelRequested -MonitorState $cancelMonitor) {
+                Request-LadaBatchCancellation
+            }
+
+            if ($script:RestoreSoaPicWebmCancelled) {
+                $cancelRequested = $true
+                $null = $ladaProcess.WaitForExit(5000)
+                break
+            }
+        }
+
+        $cancelRequested = $script:RestoreSoaPicWebmCancelled
+        $ladaExitCode = if ($cancelRequested) { 130 } else { $ladaProcess.ExitCode }
     }
     finally {
+        Stop-ConsoleCancelMonitor -MonitorState $cancelMonitor
+        if ($hadSvtLog) {
+            $env:SVT_LOG = $originalSvtLog
+        }
+        else {
+            Remove-Item Env:SVT_LOG -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $ladaProcess) {
+            try {
+                if (-not $ladaProcess.HasExited) {
+                    Stop-ProcessTree -ProcessId $ladaProcess.Id
+                }
+                else {
+                    Stop-ProcessTree -ProcessId $ladaProcess.Id -IncludeRoot:$false
+                }
+            }
+            finally {
+                $ladaProcess.Dispose()
+            }
+        }
+        $script:RestoreSoaPicWebmCancelled = $false
+        $script:RestoreSoaPicWebmProcessId = 0
+        $script:RestoreSoaPicWebmCancellationNoticeShown = $false
         Pop-Location
     }
+
+    return $ladaExitCode
 }
 
 if (-not (Test-Path -LiteralPath $SourceRoot)) {
@@ -190,7 +454,7 @@ else {
 }
 
 $resolvedStatePath = if ([string]::IsNullOrWhiteSpace($StatePath)) {
-    Get-DefaultStatePath -ResolvedProjectRoot $resolvedProjectRoot
+    Get-DefaultStatePath
 }
 else {
     Get-FullPath $StatePath
@@ -231,16 +495,35 @@ if ($sourceFiles.Count -eq 0) {
 
 $readyOutputCount = 0
 $readyBackupCount = 0
+$staleOutputPaths = New-Object System.Collections.Generic.List[string]
 foreach ($file in $sourceFiles) {
     $relativePath = Get-RelativePath -BasePath $SourceRoot -TargetPath $file.FullName
     $finalOutputPath = Join-Path $resolvedOutputRoot $relativePath
     $backupPath = Join-Path $resolvedBackupRoot $relativePath
 
     if ((-not $ForceReconvert) -and (Test-Path -LiteralPath $finalOutputPath)) {
-        $readyOutputCount++
+        if (Test-OutputFileReady -OutputPath $finalOutputPath) {
+            $readyOutputCount++
+        }
+        else {
+            $staleOutputPaths.Add($finalOutputPath)
+        }
     }
     if ((-not $ForceBackup) -and (Test-BackupFileReady -SourceFile $file -BackupPath $backupPath)) {
         $readyBackupCount++
+    }
+}
+
+$staleOutputPaths = @($staleOutputPaths | Sort-Object -Unique)
+if ($staleOutputPaths.Count -gt 0) {
+    Write-Warning "Found $($staleOutputPaths.Count) stale output file(s) with mismatched container signatures. They will be regenerated."
+    if (-not $DryRun) {
+        foreach ($staleOutputPath in $staleOutputPaths) {
+            if (-not (Test-IsPathInside -ParentPath $resolvedOutputRoot -ChildPath $staleOutputPath)) {
+                throw "Refusing to remove stale output outside output root: $staleOutputPath"
+            }
+            Remove-Item -LiteralPath $staleOutputPath -Force
+        }
     }
 }
 
@@ -258,16 +541,22 @@ $cliArgs = @(
     "--retry-failed-first",
     "--retry-count", [string]$RetryCount,
     "--retry-delay-seconds", [string]$RetryDelaySeconds,
-    "--working-output-extension", ".mp4",
+    "--working-output-extension", ".working.webm",
     "--output-file-pattern", "{orig_file_name}.webm"
 )
 
+$explicitEncodingOverride = $false
 $explicitFp16Override = $false
 foreach ($arg in $ExtraLadaArgs) {
+    if ($arg -in @("--encoding-preset", "--encoder", "--encoder-options")) {
+        $explicitEncodingOverride = $true
+    }
     if ($arg -in @("--fp16", "--no-fp16")) {
         $explicitFp16Override = $true
-        break
     }
+}
+if (-not $explicitEncodingOverride) {
+    $cliArgs += Get-DefaultWebmEncodingArgs
 }
 if ((-not $explicitFp16Override) -and $Device.ToLowerInvariant().StartsWith("vulkan")) {
     $cliArgs += "--fp16"
@@ -298,6 +587,9 @@ Write-Host "Device      : $Device"
 Write-Host "Max files   : $(if ($MaxFiles -gt 0) { $MaxFiles } else { 'all' })"
 Write-Host "Files found : $($sourceFiles.Count)"
 Write-Host "Resume      : backup ready $readyBackupCount/$($sourceFiles.Count), output ready $readyOutputCount/$($sourceFiles.Count)"
+if ($staleOutputPaths.Count -gt 0) {
+    Write-Host "Stale output: $($staleOutputPaths.Count) invalid file(s) will be regenerated"
+}
 Write-Host "Lada command: $($resolvedLadaCommand -join ' ')"
 if ($DryRun) {
     Write-Host "Mode        : DryRun"
@@ -312,4 +604,14 @@ if ((-not $DryRun) -and $pendingOutputCount -le 0 -and $pendingBackupCount -le 0
 Write-Host "Running internal lada-cli batch mode..."
 Write-Host ""
 
-Invoke-LadaCliBatch -Command $resolvedLadaCommand -Arguments $cliArgs -WorkingDirectory $resolvedProjectRoot
+$ladaBatchExitCode = Invoke-LadaCliBatch -Command $resolvedLadaCommand -Arguments $cliArgs -WorkingDirectory $resolvedProjectRoot
+$global:LASTEXITCODE = $ladaBatchExitCode
+
+if ($ladaBatchExitCode -eq 130) {
+    Write-Warning "lada-cli cancelled by Ctrl+C."
+    return
+}
+
+if ($ladaBatchExitCode -ne 0) {
+    throw "lada-cli exited with code $ladaBatchExitCode"
+}
