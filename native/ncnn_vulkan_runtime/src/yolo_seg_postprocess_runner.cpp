@@ -59,6 +59,7 @@ struct Candidate
     float y2 = 0.f;
     float confidence = 0.f;
     int class_id = 0;
+    int source_index = 0;
     std::vector<float> mask_coeffs;
 };
 
@@ -135,7 +136,7 @@ std::vector<Candidate> collect_candidates(
     const PredictionAccessor& pred,
     int num_classes,
     int mask_dim,
-    float conf_threshold)
+    const YoloSegPostprocessConfig& config)
 {
     std::vector<Candidate> candidates;
     candidates.reserve(pred.num_boxes());
@@ -150,7 +151,12 @@ std::vector<Candidate> collect_candidates(
                 best_class = class_index;
             }
         }
-        if (best_confidence <= conf_threshold) {
+        const bool class_allowed = config.allowed_classes.empty()
+            || (
+                best_class >= 0
+                && best_class < static_cast<int>(config.allowed_classes.size())
+                && config.allowed_classes[static_cast<std::size_t>(best_class)] != 0);
+        if (best_confidence <= config.conf_threshold || !class_allowed) {
             continue;
         }
 
@@ -166,6 +172,7 @@ std::vector<Candidate> collect_candidates(
         candidate.y2 = center_y + height * 0.5f;
         candidate.confidence = best_confidence;
         candidate.class_id = best_class;
+        candidate.source_index = box_index;
         candidate.mask_coeffs.resize(mask_dim);
         for (int mask_index = 0; mask_index < mask_dim; ++mask_index) {
             candidate.mask_coeffs[mask_index] = pred.at(4 + num_classes + mask_index, box_index);
@@ -177,8 +184,16 @@ std::vector<Candidate> collect_candidates(
         candidates.begin(),
         candidates.end(),
         [](const Candidate& left, const Candidate& right) {
+            if (left.confidence == right.confidence) {
+                return left.source_index < right.source_index;
+            }
             return left.confidence > right.confidence;
         });
+    if (config.max_nms <= 0) {
+        candidates.clear();
+    } else if (static_cast<int>(candidates.size()) > config.max_nms) {
+        candidates.resize(static_cast<std::size_t>(config.max_nms));
+    }
     return candidates;
 }
 
@@ -288,14 +303,18 @@ void crop_mask_inplace(
     const float width_ratio = static_cast<float>(mask_width) / static_cast<float>(config.input_width);
     const float height_ratio = static_cast<float>(mask_height) / static_cast<float>(config.input_height);
 
-    const int x1 = std::max(0, python_round_to_int(candidate.x1 * width_ratio));
-    const int y1 = std::max(0, python_round_to_int(candidate.y1 * height_ratio));
-    const int x2 = std::min(mask_width, python_round_to_int(candidate.x2 * width_ratio));
-    const int y2 = std::min(mask_height, python_round_to_int(candidate.y2 * height_ratio));
+    const float x1 = candidate.x1 * width_ratio;
+    const float y1 = candidate.y1 * height_ratio;
+    const float x2 = candidate.x2 * width_ratio;
+    const float y2 = candidate.y2 * height_ratio;
 
     for (int y = 0; y < mask_height; ++y) {
         for (int x = 0; x < mask_width; ++x) {
-            if (y < y1 || y >= y2 || x < x1 || x >= x2) {
+            if (
+                static_cast<float>(y) < y1
+                || static_cast<float>(y) >= y2
+                || static_cast<float>(x) < x1
+                || static_cast<float>(x) >= x2) {
                 mask[static_cast<std::size_t>(y) * mask_width + x] = 0.f;
             }
         }
@@ -354,6 +373,11 @@ std::vector<unsigned char> threshold_mask(
         thresholded[index] = mask[index] > threshold ? active_value : static_cast<unsigned char>(0);
     }
     return thresholded;
+}
+
+bool mask_has_active_pixel(const std::vector<unsigned char>& mask)
+{
+    return std::any_of(mask.begin(), mask.end(), [](unsigned char value) { return value != 0; });
 }
 
 std::vector<unsigned char> scale_and_unpad_mask(
@@ -437,7 +461,7 @@ YoloSegSelectionResult select_yolo_segmentation_cpu(
         pred,
         config.num_classes,
         layout.mask_dim,
-        config.conf_threshold);
+        config);
     std::vector<Candidate> detections = apply_nms(
         candidates,
         config.iou_threshold,
@@ -526,16 +550,13 @@ YoloSegPostprocessResult finalize_yolo_segmentation_cpu(
             config.input_height,
             config.input_width);
         const std::vector<unsigned char> input_space_mask = threshold_mask(upsampled_mask, 0.f, 255);
+        if (!mask_has_active_pixel(input_space_mask)) {
+            continue;
+        }
 
         YoloSegDetection output_detection;
         output_detection.box = selected_detection.box;
         output_detection.mask = scale_and_unpad_mask(input_space_mask, config);
-        if (std::none_of(
-                output_detection.mask.begin(),
-                output_detection.mask.end(),
-                [](unsigned char value) { return value != 0; })) {
-            continue;
-        }
         result.detections.push_back(std::move(output_detection));
     }
 

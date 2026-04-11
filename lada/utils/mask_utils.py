@@ -67,70 +67,28 @@ def get_mask_area(mask: Mask) -> float:
 def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
-_BLEND_MASK_BOX_BORDER_RATIO = 0.05
-
-
-def _resolve_blend_box(mask: torch.Tensor) -> tuple[int, int, int, int, int]:
-    nonzero = torch.nonzero(mask > 0, as_tuple=False)
-    if nonzero.numel() == 0:
-        return 0, 0, 0, 0, 0
-
-    top = int(nonzero[:, 0].min().item())
-    bottom = int(nonzero[:, 0].max().item()) + 1
-    left = int(nonzero[:, 1].min().item())
-    right = int(nonzero[:, 1].max().item()) + 1
-
-    box_height = max(bottom - top, 1)
-    box_width = max(right - left, 1)
-    border_y = max(1, int(round(box_height * _BLEND_MASK_BOX_BORDER_RATIO)))
-    border_x = max(1, int(round(box_width * _BLEND_MASK_BOX_BORDER_RATIO)))
-
-    inner_top = max(0, top - border_y)
-    inner_bottom = min(mask.shape[0], bottom + border_y)
-    inner_left = max(0, left - border_x)
-    inner_right = min(mask.shape[1], right + border_x)
-
-    border_height = (top - inner_top) + (inner_bottom - bottom)
-    border_width = (left - inner_left) + (inner_right - right)
-    border_size = min(border_height, border_width)
-    return inner_top, inner_bottom, inner_left, inner_right, border_size
-
-
-def _create_blend_mask_cpu(mask: torch.Tensor, blur_size: int, inner_top: int, inner_bottom: int, inner_left: int, inner_right: int) -> torch.Tensor:
-    mask_np = (mask.numpy() > 0).astype(np.float32)
-    blend = np.zeros(mask.shape, dtype=np.float32)
-    blend[inner_top:inner_bottom, inner_left:inner_right] = 1.0
-    blend = np.maximum(mask_np, blend)
-    if blur_size >= 5:
-        blend = cv2.blur(blend, (blur_size, blur_size), borderType=cv2.BORDER_REFLECT)
-    return torch.from_numpy(blend).to(dtype=mask.dtype)
-
 def create_blend_mask(crop_mask: torch.Tensor):
     mask = crop_mask.squeeze()
-    inner_top, inner_bottom, inner_left, inner_right, border_size = _resolve_blend_box(mask)
-    if border_size == 0:
-        return torch.zeros_like(mask)
+    h, w = mask.shape
+    border_ratio = 0.05
+    h_inner, w_inner = int(h * (1.0 - border_ratio)), int(w * (1.0 - border_ratio))
+    h_outer, w_outer = h - h_inner, w - w_inner
+    border_size = min(h_outer, w_outer)
+    if border_size < 5:
+        return torch.ones_like(mask)
     blur_size = int(border_size)
     if blur_size % 2 == 0:
         blur_size += 1
-    mask4 = (mask > 0).to(dtype=mask.dtype)
-    if mask.device.type == 'cpu':
-        blend = _create_blend_mask_cpu(
-            mask,
-            blur_size,
-            inner_top,
-            inner_bottom,
-            inner_left,
-            inner_right,
-        )
-        assert blend.shape == mask.shape
-        return blend
-    blend = torch.zeros_like(mask, dtype=mask.dtype)
-    blend[inner_top:inner_bottom, inner_left:inner_right] = 1.0
+    inner = torch.ones((h_inner, w_inner), device=mask.device, dtype=mask.dtype)
+    pad_top = h_outer // 2
+    pad_bottom = h_outer - pad_top
+    pad_left = w_outer // 2
+    pad_right = w_outer - pad_left
+    blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+    mask4 = (mask > 0)
     blend = torch.maximum(mask4, blend)
-    if blur_size >= 5:
-        kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
-        blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
+    kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
+    blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
     assert blend.shape == mask.shape
     return blend
 

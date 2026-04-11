@@ -3,31 +3,13 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import argparse
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files
 from os.path import join as ospj
 import shutil
 import os
 import sys
 import pathlib
 import fnmatch
-
-def _resolve_windows_binary(binary_name: str) -> str:
-    binary_path = shutil.which(binary_name)
-    assert binary_path is not None, f"{binary_name} not found"
-
-    candidate = pathlib.Path(binary_path)
-    shim_path = candidate.with_suffix(".shim")
-    if shim_path.exists():
-        for line in shim_path.read_text(encoding="utf-8").splitlines():
-            if not line.lower().startswith("path"):
-                continue
-            _, resolved_path = line.split("=", 1)
-            resolved_path = resolved_path.strip().strip('"')
-            if pathlib.Path(resolved_path).exists():
-                print(f"-> Resolved shim {candidate} -> {resolved_path}")
-                return resolved_path
-
-    return binary_path
 
 def get_project_root() -> str:
     project_root = pathlib.Path(".").absolute()
@@ -85,8 +67,10 @@ def set_environment_variables(project_root_dir: str):
     assert bin_gdbus is not None, "gdbus.exe not found. Did gvsbuild successfully build GTK libs?"
 
 def get_common_binaries(project_root):
-    bin_ffmpeg = _resolve_windows_binary("ffmpeg.exe")
-    bin_ffprobe = _resolve_windows_binary("ffprobe.exe")
+    bin_ffmpeg = shutil.which("ffmpeg.exe")
+    assert bin_ffmpeg is not None, "ffmpeg.exe not found"
+    bin_ffprobe = shutil.which("ffprobe.exe")
+    assert bin_ffprobe is not None, "ffprobe.exe not found"
 
     common_binaries = [
         (bin_ffmpeg, "bin"),
@@ -94,19 +78,8 @@ def get_common_binaries(project_root):
     ]
 
     common_binaries += get_intel_xpu_runtime_libs(project_root)
-    common_binaries += get_local_ncnn_runtime_binaries(project_root)
 
     return common_binaries
-
-def get_local_ncnn_runtime_binaries(project_root):
-    runtime_dir = pathlib.Path(project_root) / "native" / "ncnn_vulkan_runtime" / "build" / "local_runtime"
-    if not runtime_dir.exists():
-        print("-> Local NCNN Vulkan runtime not found; skipping bundled local runtime.")
-        return []
-
-    print(f"-> Bundling local NCNN Vulkan runtime from {runtime_dir}")
-    destination = "native/ncnn_vulkan_runtime/build/local_runtime"
-    return [(str(p), destination) for p in runtime_dir.iterdir() if p.is_file()]
 
 def get_common_datas(project_root: str):
     common_datas = [
@@ -117,64 +90,8 @@ def get_common_datas(project_root: str):
         (ospj(project_root, 'model_weights/3rd_party/clean_youknow_video.pth'), 'model_weights/3rd_party'),
         (ospj(project_root, 'lada/utils/encoding_presets.csv'), 'lada/utils'),
     ]
-    common_datas += get_bundled_pnnx_datas()
-    common_datas += get_optional_detection_artifact_datas(project_root)
-    common_datas += get_optional_vulkan_cache_datas()
     common_datas += [(str(p), str(p.relative_to(project_root).parent)) for p in pathlib.Path(ospj(project_root, "lada/locale")).rglob("*.mo")]
     return common_datas
-
-def get_bundled_pnnx_datas():
-    try:
-        return collect_data_files("pnnx", include_py_files=False)
-    except Exception:
-        print("-> pnnx package not found; skipping bundled pnnx data files.")
-        return []
-
-def get_common_hiddenimports():
-    try:
-        return collect_submodules("pnnx")
-    except Exception:
-        print("-> pnnx package not found; skipping bundled pnnx hidden imports.")
-        return []
-
-def _collect_directory_tree(source_dir: pathlib.Path, destination_root: str) -> list[tuple[str, str]]:
-    if not source_dir.exists():
-        return []
-
-    bundled_files = []
-    for path in source_dir.rglob("*"):
-        if not path.is_file() or "__pycache__" in path.parts:
-            continue
-        relative_parent = path.relative_to(source_dir).parent
-        destination = pathlib.Path(destination_root) / relative_parent
-        bundled_files.append((str(path), destination.as_posix()))
-    return bundled_files
-
-def get_optional_detection_artifact_datas(project_root: str) -> list[tuple[str, str]]:
-    model_weights_dir = pathlib.Path(project_root) / "model_weights"
-    bundled_files = []
-    for pattern in ("*.fp16_ncnn_model", "*.fp32_ncnn_model"):
-        for model_dir in model_weights_dir.glob(pattern):
-            print(f"-> Bundling pre-exported detection artifacts from {model_dir}")
-            bundled_files += _collect_directory_tree(
-                model_dir,
-                str(model_dir.relative_to(project_root)).replace("\\", "/"),
-            )
-    return bundled_files
-
-def get_optional_vulkan_cache_datas() -> list[tuple[str, str]]:
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if not local_appdata:
-        return []
-
-    cache_root = pathlib.Path(local_appdata) / "lada" / "vulkan_cache"
-    cache_dir = cache_root / "lada_mosaic_restoration_model_generic_v1.2.vulkan_modular_5f_r13"
-    if not cache_dir.exists():
-        print("-> Bundled Vulkan cache artifacts not found; runtime will build them on demand.")
-        return []
-
-    print(f"-> Bundling pre-exported BasicVSR++ Vulkan cache from {cache_dir}")
-    return _collect_directory_tree(cache_dir, f"vulkan_cache/{cache_dir.name}")
 
 def get_gui_components(project_root_dir: str, common_datas: list, common_binaries: list, common_runtime_hooks: list, common_icon):
     gui_datas = common_datas + [
@@ -203,7 +120,7 @@ def get_gui_components(project_root_dir: str, common_datas: list, common_binarie
         pathex=[],
         binaries=gui_binaries,
         datas=gui_datas,
-        hiddenimports=COMMON_HIDDENIMPORTS,
+        hiddenimports=[],
         hookspath=[],
         hooksconfig={
             "gi": {
@@ -241,7 +158,7 @@ def get_cli_components(project_root_dir: str, common_datas: list, common_binarie
         pathex=[],
         binaries=common_binaries,
         datas=common_datas,
-        hiddenimports=COMMON_HIDDENIMPORTS,
+        hiddenimports=[],
         hookspath=[],
         hooksconfig={},
         runtime_hooks=common_runtime_hooks,
@@ -288,7 +205,6 @@ if not args.cli_only:
     set_environment_variables(project_root)
 
 common_datas = get_common_datas(project_root)
-COMMON_HIDDENIMPORTS = get_common_hiddenimports()
 
 common_binaries = get_common_binaries(project_root)
 

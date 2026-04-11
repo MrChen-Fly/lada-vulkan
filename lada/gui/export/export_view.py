@@ -411,10 +411,7 @@ class ExportView(Gtk.Widget):
         assert os.path.isfile(source_file.get_path())
         restore_file_path = restore_file.get_path()
         temp_dir = self._config.temp_directory
-        video_tmp_file_output_path = video_utils.build_temp_video_output_path(
-            temp_dir,
-            restore_file_path,
-        )
+        video_tmp_file_output_path = os.path.join(temp_dir, f"{os.path.basename(os.path.splitext(restore_file_path)[0])}.tmp{os.path.splitext(restore_file_path)[1]}")
         self.temp_file_path = video_tmp_file_output_path
 
         if not self.resume_info:

@@ -1,20 +1,17 @@
 ## Build exe
 
 ```powershell
-powershell -ExecutionPolicy Bypass ./packaging/windows/package_executable.ps1 -extra nvidia -artifactFlavor vulkan
+powershell -ExecutionPolicy Bypass ./packaging/windows/package_executable.ps1 -extra nvidia
 ```
 
 Script options:
 * `-extra <EXTRA>`: Install python extra. EXTRA currently can be `intel` or `nvidia`
-* `-artifactFlavor <NAME>`: Controls the release/archive label. Default is `vulkan`
 * `-skipWinget`: Skip installing/upgrading system dependencies via winget
 * `-skipGvsbuild`: Skip installing/upgrading system dependencies via gvsbuild
 * `-skipArchive`: Skip creating 7z archives
 * `-skipTranslations`: Skip compiling translations. If set no translations will be included in the release
 * `-cleanGvsbuild`: Does a clean build of gvsbuild
 * `-cliOnly`: Builds only `lada-cli.exe`
-
-`-extra` still controls which Python dependency set gets installed. `-artifactFlavor` controls how the packaged archive is named.
 
 > [!TIP]
 > If you updated `gvsbuild`, `uv` or `python` do a clean build (`--clean-gvsbuild`)

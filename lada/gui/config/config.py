@@ -11,7 +11,6 @@ from pathlib import Path
 from gi.repository import GLib, GObject, Adw
 
 from lada import LOG_LEVEL, ModelFiles
-from lada.compute_targets import get_default_compute_target
 from lada.gui import utils
 from lada.utils import os_utils, video_utils
 
@@ -31,7 +30,7 @@ class PostExportAction(Enum):
 class Config(GObject.Object):
     _defaults = {
         'color_scheme': ColorScheme.SYSTEM,
-        'device': get_default_compute_target(),
+        'device': os_utils.get_default_torch_device(),
         'custom_encoding_presets': set(),
         'encoding_preset_name': video_utils.get_default_preset_name(),
         'export_directory': None,

@@ -9,3 +9,6 @@ Conventions:
 - Generated JSON outputs and preview media are runtime artifacts, not source.
 - Benchmark outputs should go to `.helloagents/tmp/` or a system temp directory.
 - When measurements need to be regenerated, rerun the benchmark scripts directly.
+- Manual CPU-vs-Vulkan parity checks live in
+  `scripts/evaluation/compare-restoration-devices.py`; they are intentionally
+  separate from these benchmark/profiling scripts.

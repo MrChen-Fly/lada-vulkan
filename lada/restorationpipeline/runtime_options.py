@@ -59,24 +59,26 @@ class RestorationSchedulingOptions:
 
 
 @dataclass(frozen=True)
-class BasicvsrppVulkanRuntimeFeatures:
-    """Describe optional Vulkan fast paths exposed by the native runtime."""
+class RestorationRuntimeFeatures:
+    """Describe optional runtime fast paths exposed by one restoration backend."""
 
-    use_gpu_blob_bridge: bool = False
-    use_vulkan_frame_preprocess: bool = False
-    use_vulkan_frame_preprocess_batch: bool = False
-    use_fused_restore_clip: bool = False
-    use_recurrent_modular_runtime: bool = False
+    use_native_blob_bridge: bool = False
+    use_native_frame_preprocess: bool = False
+    use_native_frame_preprocess_batch: bool = False
+    use_native_fused_restore_clip: bool = False
+    use_native_recurrent_runtime: bool = False
     use_native_clip_runner: bool = False
     supports_descriptor_restore: bool = False
-    use_vulkan_blend_patch: bool = False
-    use_vulkan_blend_patch_inplace: bool = False
-    use_vulkan_blend_patch_preprocess: bool = False
-    use_vulkan_blend_patch_preprocess_inplace: bool = False
-    use_vulkan_blend_patch_preprocess_batch_inplace: bool = False
+    use_native_blend_patch: bool = False
+    use_native_blend_patch_inplace: bool = False
+    use_native_padded_blend_patch: bool = False
+    use_native_padded_blend_patch_inplace: bool = False
+    use_native_padded_blend_patch_batch_inplace: bool = False
 
 
-def resolve_restoration_scheduling_options(model: object) -> RestorationSchedulingOptions:
+def resolve_restoration_scheduling_options(
+    model: object,
+) -> RestorationSchedulingOptions:
     """Read restoration scheduling knobs from a model in one place."""
     get_options = getattr(model, "get_runtime_scheduling_options", None)
     if callable(get_options):
@@ -91,16 +93,85 @@ def resolve_restoration_scheduling_options(model: object) -> RestorationScheduli
     ).normalized()
 
 
-def resolve_basicvsrpp_vulkan_runtime_features(model: object) -> BasicvsrppVulkanRuntimeFeatures:
-    """Read Vulkan runtime feature flags from a model in one place."""
+def resolve_restoration_runtime_features(
+    model: object,
+) -> RestorationRuntimeFeatures:
+    """Read backend runtime feature flags from a model in one place."""
     get_features = getattr(model, "get_runtime_features", None)
     if callable(get_features):
         features = get_features()
-        if isinstance(features, BasicvsrppVulkanRuntimeFeatures):
+        if isinstance(features, RestorationRuntimeFeatures):
             return features
 
-    return BasicvsrppVulkanRuntimeFeatures(
+    return RestorationRuntimeFeatures(
+        use_native_blob_bridge=bool(
+            getattr(model, "use_native_blob_bridge", getattr(model, "use_gpu_blob_bridge", False))
+        ),
+        use_native_frame_preprocess=bool(
+            getattr(
+                model,
+                "use_native_frame_preprocess",
+                getattr(model, "use_vulkan_frame_preprocess", False),
+            )
+        ),
+        use_native_frame_preprocess_batch=bool(
+            getattr(
+                model,
+                "use_native_frame_preprocess_batch",
+                getattr(model, "use_vulkan_frame_preprocess_batch", False),
+            )
+        ),
+        use_native_fused_restore_clip=bool(
+            getattr(
+                model,
+                "use_native_fused_restore_clip",
+                getattr(model, "use_fused_restore_clip", False),
+            )
+        ),
+        use_native_recurrent_runtime=bool(
+            getattr(
+                model,
+                "use_native_recurrent_runtime",
+                getattr(model, "use_recurrent_modular_runtime", False),
+            )
+        ),
+        use_native_clip_runner=bool(getattr(model, "use_native_clip_runner", False)),
         supports_descriptor_restore=bool(
             getattr(model, "supports_descriptor_restore", False)
-        )
+        ),
+        use_native_blend_patch=bool(
+            getattr(
+                model,
+                "use_native_blend_patch",
+                getattr(model, "use_vulkan_blend_patch", False),
+            )
+        ),
+        use_native_blend_patch_inplace=bool(
+            getattr(
+                model,
+                "use_native_blend_patch_inplace",
+                getattr(model, "use_vulkan_blend_patch_inplace", False),
+            )
+        ),
+        use_native_padded_blend_patch=bool(
+            getattr(
+                model,
+                "use_native_padded_blend_patch",
+                getattr(model, "use_vulkan_blend_patch_preprocess", False),
+            )
+        ),
+        use_native_padded_blend_patch_inplace=bool(
+            getattr(
+                model,
+                "use_native_padded_blend_patch_inplace",
+                getattr(model, "use_vulkan_blend_patch_preprocess_inplace", False),
+            )
+        ),
+        use_native_padded_blend_patch_batch_inplace=bool(
+            getattr(
+                model,
+                "use_native_padded_blend_patch_batch_inplace",
+                getattr(model, "use_vulkan_blend_patch_preprocess_batch_inplace", False),
+            )
+        ),
     )

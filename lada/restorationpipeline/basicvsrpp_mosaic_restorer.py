@@ -4,12 +4,9 @@ from lada.models.basicvsrpp.basicvsrpp_gan import BasicVSRPlusPlusGan
 from lada.utils import ImageTensor
 
 class BasicvsrppMosaicRestorer:
-    runtime = "torch"
-
     def __init__(self, model: BasicVSRPlusPlusGan, device: torch.device, fp16: bool):
         self.model = model
         self.device: torch.device = torch.device(device)
-        self.torch_device: torch.device = self.device
         self.dtype = torch.float16 if fp16 else torch.float32
 
     def restore(self, video: list[ImageTensor], max_frames=-1) -> list[ImageTensor]:
@@ -36,15 +33,3 @@ class BasicvsrppMosaicRestorer:
             assert input_frame_count == output_frame_count and input_frame_shape == output_frame_shape
 
         return result
-
-    def release_cached_memory(self) -> None:
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-        elif self.device.type == "mps" and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        elif (
-            self.device.type == "xpu"
-            and hasattr(torch, "xpu")
-            and hasattr(torch.xpu, "empty_cache")
-        ):
-            torch.xpu.empty_cache()

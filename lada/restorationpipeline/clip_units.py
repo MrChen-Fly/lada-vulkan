@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from time import perf_counter
 from typing import Tuple
 
@@ -15,7 +16,12 @@ from lada.utils import Box
 from lada.utils import Image, ImageTensor, Mask, MaskTensor, Pad, VideoMetadata
 from lada.utils import image_utils
 from lada.utils.box_utils import box_overlap
-from lada.utils.scene_utils import expand_box_to_target
+
+from .clip_resize_semantics import (
+    ClipFrameResizeMode,
+    floor_resized_length,
+    resize_and_pad_clip_frame,
+)
 
 _CROP_TARGET_EXPANSION_FACTOR = 1.0
 _CROP_BORDER_RATIO = 0.06
@@ -23,12 +29,88 @@ _CROP_BORDER_RATIO = 0.06
 type SceneMask = Mask | MaskTensor
 
 
+def _expand_box_to_target(
+    box: Box,
+    image_shape: tuple[int, ...],
+    target_size: tuple[int, int],
+    max_box_expansion_factor: float = 1.0,
+    border_size: float = 0,
+) -> tuple[Box, float]:
+    target_width, target_height = target_size
+    t, l, b, r = box
+    width, height = r - l + 1, b - t + 1
+    border_size = max(20, int(max(width, height) * border_size)) if border_size > 0.0 else 0
+    t = max(0, t - border_size)
+    l = max(0, l - border_size)
+    b = min(image_shape[0] - 1, b + border_size)
+    r = min(image_shape[1] - 1, r + border_size)
+    width, height = r - l + 1, b - t + 1
+    down_scale_factor = min(target_width / width, target_height / height)
+    if down_scale_factor > 1.0:
+        down_scale_factor = 1.0
+    missing_width = int((target_width - (width * down_scale_factor)) / down_scale_factor)
+    missing_height = int((target_height - (height * down_scale_factor)) / down_scale_factor)
+
+    available_width_l = l
+    available_width_r = (image_shape[1] - 1) - r
+    available_height_t = t
+    available_height_b = (image_shape[0] - 1) - b
+
+    budget_width = int(max_box_expansion_factor * width)
+    budget_height = int(max_box_expansion_factor * height)
+
+    expand_width_lr = min(available_width_l, available_width_r, missing_width // 2, budget_width)
+    expand_width_l = min(
+        available_width_l - expand_width_lr,
+        missing_width - expand_width_lr * 2,
+        budget_width - expand_width_lr,
+    )
+    expand_width_r = min(
+        available_width_r - expand_width_lr,
+        missing_width - expand_width_lr * 2 - expand_width_l,
+        budget_width - expand_width_lr - expand_width_l,
+    )
+
+    expand_height_tb = min(
+        available_height_t,
+        available_height_b,
+        missing_height // 2,
+        budget_height,
+    )
+    expand_height_t = min(
+        available_height_t - expand_height_tb,
+        missing_height - expand_height_tb * 2,
+        budget_height - expand_height_tb,
+    )
+    expand_height_b = min(
+        available_height_b - expand_height_tb,
+        missing_height - expand_height_tb * 2 - expand_height_t,
+        budget_height - expand_height_tb - expand_height_t,
+    )
+
+    l, r = (
+        l - math.floor(expand_width_lr / 2) - expand_width_l,
+        r + math.ceil(expand_width_lr / 2) + expand_width_r,
+    )
+    t, b = (
+        t - math.floor(expand_height_tb / 2) - expand_height_t,
+        b + math.ceil(expand_height_tb / 2) + expand_height_b,
+    )
+    width, height = r - l + 1, b - t + 1
+    scale_factor = (
+        down_scale_factor
+        if down_scale_factor <= 1.0
+        else min(target_width / width, target_height / height)
+    )
+    return (t, l, b, r), scale_factor
+
+
 def _resolve_crop_box(
     box: Box,
     frame_shape: tuple[int, ...],
     size: int,
 ) -> Box:
-    crop_box, _ = expand_box_to_target(
+    crop_box, _ = _expand_box_to_target(
         box,
         frame_shape,
         (size, size),
@@ -301,13 +383,19 @@ def build_clip_resize_plans(
     crop_shapes: list[tuple[int, ...]],
 ) -> list["ClipResizePlan"]:
     max_width, max_height = descriptor.resize_reference_shape
-    scale_width = descriptor.size / max_width
-    scale_height = descriptor.size / max_height
     resize_plans: list[ClipResizePlan] = []
     for crop_shape in crop_shapes:
         resize_shape = (
-            int(crop_shape[0] * scale_height),
-            int(crop_shape[1] * scale_width),
+            floor_resized_length(
+                crop_shape[0],
+                target_size=descriptor.size,
+                reference_length=max_height,
+            ),
+            floor_resized_length(
+                crop_shape[1],
+                target_size=descriptor.size,
+                reference_length=max_width,
+            ),
         )
         resize_height, resize_width = resize_shape
         if (
@@ -344,25 +432,23 @@ def materialize_clip_frames_with_profile(
     *,
     size: int,
     pad_mode: str,
+    resize_mode: ClipFrameResizeMode = "opencv",
     profile: dict[str, float] | None = None,
 ) -> tuple[list[Image | ImageTensor], list[Pad]]:
     started_at = perf_counter()
     frames: list[Image | ImageTensor] = []
     pad_after_resizes: list[Pad] = []
     for cropped_img, resize_plan in zip(cropped_frames, resize_plans):
-        resized_img = image_utils.resize(
+        padded_img = resize_and_pad_clip_frame(
             cropped_img,
-            resize_plan.resize_shape,
-            interpolation=cv2.INTER_LINEAR,
-        )
-        padded_img, pad_after_resize = image_utils.pad_image(
-            resized_img,
-            size,
-            size,
-            mode=pad_mode,
+            resize_shape=resize_plan.resize_shape,
+            pad_after_resize=resize_plan.pad_after_resize,
+            size=size,
+            pad_mode=pad_mode,
+            resize_mode=resize_mode,
         )
         frames.append(padded_img)
-        pad_after_resizes.append(pad_after_resize)
+        pad_after_resizes.append(resize_plan.pad_after_resize)
 
     if profile is not None:
         profile["clip_resize_pad_s"] = profile.get("clip_resize_pad_s", 0.0) + (
@@ -424,14 +510,21 @@ class Clip:
         return self.frame_start + len(self.frames) - 1
 
     @classmethod
-    def from_descriptor(cls, descriptor: ClipDescriptor) -> "Clip":
-        return cls.from_descriptor_with_profile(descriptor)
+    def from_descriptor(
+        cls,
+        descriptor: ClipDescriptor,
+        *,
+        resize_mode: ClipFrameResizeMode = "opencv",
+    ) -> "Clip":
+        return cls.from_descriptor_with_profile(descriptor, resize_mode=resize_mode)
 
     @classmethod
     def from_descriptor_with_profile(
         cls,
         descriptor: ClipDescriptor,
         profile: dict[str, float] | None = None,
+        *,
+        resize_mode: ClipFrameResizeMode = "opencv",
     ) -> "Clip":
         frames, masks, boxes, crop_shapes = crop_descriptor_with_profile(descriptor, profile)
         resize_plans = build_clip_resize_plans(descriptor, crop_shapes)
@@ -441,6 +534,7 @@ class Clip:
             resize_plans,
             size=descriptor.size,
             pad_mode=descriptor.pad_mode,
+            resize_mode=resize_mode,
             profile=None,
         )
         masks, _ = materialize_clip_masks_with_profile(

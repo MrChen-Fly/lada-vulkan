@@ -68,6 +68,122 @@ def _has_lada_gridsample_runtime() -> bool:
     return ncnn_has_lada_gridsample_layer(ncnn_module)
 
 
+def _is_scalar_mul_layer(
+    parsed: tuple[str, str, list[str], list[str], list[str]],
+) -> bool:
+    layer_type, _, inputs, outputs, params = parsed
+    return (
+        layer_type == "BinaryOp"
+        and len(inputs) == 1
+        and len(outputs) == 1
+        and len(params) >= 3
+        and params[0] == "0=2"
+        and params[1] == "1=1"
+    )
+
+
+def _patch_spynet_resize_back_tail(
+    layer_lines: list[str],
+) -> tuple[list[str], bool]:
+    if not layer_lines:
+        return layer_lines, False
+
+    last_layer = _parse_ncnn_layer(layer_lines[-1])
+    if last_layer is None:
+        return layer_lines, False
+    last_type, _, _, final_outputs, _ = last_layer
+    if last_type != "CopyTo" or "out0" not in final_outputs:
+        return layer_lines, False
+
+    interp_index: int | None = None
+    for index in range(len(layer_lines) - 1, -1, -1):
+        parsed = _parse_ncnn_layer(layer_lines[index])
+        if parsed is None:
+            return layer_lines, False
+        if parsed[0] == "Interp":
+            interp_index = index
+            break
+
+    if interp_index is None or interp_index >= len(layer_lines) - 1:
+        return layer_lines, False
+
+    tail_layers = [
+        _parse_ncnn_layer(line)
+        for line in layer_lines[interp_index + 1 :]
+    ]
+    if any(parsed is None for parsed in tail_layers):
+        return layer_lines, False
+
+    crop_layers = [
+        parsed
+        for parsed in tail_layers
+        if parsed is not None and parsed[0] == "Crop"
+    ]
+    scale_layers = [
+        parsed
+        for parsed in tail_layers
+        if parsed is not None and _is_scalar_mul_layer(parsed)
+    ]
+    if len(crop_layers) < 2 or len(scale_layers) < 2:
+        return layer_lines, False
+
+    interp_layer = _parse_ncnn_layer(layer_lines[interp_index])
+    if interp_layer is None or len(interp_layer[3]) != 1:
+        return layer_lines, False
+    resized_blob = interp_layer[3][0]
+
+    x_crop_params = crop_layers[0][4]
+    y_crop_params = crop_layers[1][4]
+    x_scale_params = scale_layers[0][4]
+    y_scale_params = scale_layers[1][4]
+    patched_lines = [
+        *layer_lines[: interp_index + 1],
+        _format_ncnn_layer(
+            "Split",
+            "spynet_output_split",
+            [resized_blob],
+            ["spynet_output_split_x", "spynet_output_split_y"],
+            [],
+        ),
+        _format_ncnn_layer(
+            "Crop",
+            "spynet_output_x",
+            ["spynet_output_split_x"],
+            ["spynet_output_x_crop"],
+            x_crop_params,
+        ),
+        _format_ncnn_layer(
+            "BinaryOp",
+            "spynet_output_x_scale",
+            ["spynet_output_x_crop"],
+            ["spynet_output_x_scaled"],
+            x_scale_params,
+        ),
+        _format_ncnn_layer(
+            "Crop",
+            "spynet_output_y",
+            ["spynet_output_split_y"],
+            ["spynet_output_y_crop"],
+            y_crop_params,
+        ),
+        _format_ncnn_layer(
+            "BinaryOp",
+            "spynet_output_y_scale",
+            ["spynet_output_y_crop"],
+            ["spynet_output_y_scaled"],
+            y_scale_params,
+        ),
+        _format_ncnn_layer(
+            "Concat",
+            "spynet_output_concat",
+            ["spynet_output_x_scaled", "spynet_output_y_scaled"],
+            ["out0"],
+            ["0=0"],
+        ),
+    ]
+    return patched_lines, True
+
+
 def _patch_spynet_output_tail(
     param_path: Path,
     layer_lines: list[str],
@@ -75,49 +191,10 @@ def _patch_spynet_output_tail(
     if not param_path.name.startswith("spynet"):
         return layer_lines, False
 
-    passthrough_layer_types = {"Split", "Crop", "Squeeze", "Reshape", "CopyTo"}
-    suffix_start = len(layer_lines)
-    saw_copyto = False
-    saw_squeeze = False
-
-    for index in range(len(layer_lines) - 1, -1, -1):
-        parsed = _parse_ncnn_layer(layer_lines[index])
-        if parsed is None:
-            return layer_lines, False
-
-        layer_type, _, _, _, _ = parsed
-        if layer_type == "CopyTo":
-            saw_copyto = True
-        if layer_type == "Squeeze":
-            saw_squeeze = True
-
-        if layer_type not in passthrough_layer_types:
-            suffix_start = index + 1
-            break
-    else:
-        suffix_start = 0
-
-    if suffix_start >= len(layer_lines):
-        return layer_lines, False
-    if not saw_copyto or not saw_squeeze:
-        return layer_lines, False
-
-    first_suffix_layer = _parse_ncnn_layer(layer_lines[suffix_start])
-    last_suffix_layer = _parse_ncnn_layer(layer_lines[-1])
-    if first_suffix_layer is None or last_suffix_layer is None:
-        return layer_lines, False
-
-    first_type, _, source_inputs, _, _ = first_suffix_layer
-    _, _, _, final_outputs, _ = last_suffix_layer
-    if first_type != "Split" or len(source_inputs) != 1 or "out0" not in final_outputs:
-        return layer_lines, False
-
-    source_blob = source_inputs[0]
-    patched_lines = [
-        *layer_lines[:suffix_start],
-        _format_ncnn_layer("Noop", "spynet_output_bypass", [source_blob], ["out0"], []),
-    ]
-    return patched_lines, True
+    patched_lines, changed = _patch_spynet_resize_back_tail(layer_lines)
+    if changed:
+        return patched_lines, True
+    return layer_lines, False
 
 
 def patch_ncnn_param_for_vulkan_runtime(

@@ -8,8 +8,7 @@ param (
     [switch]$skipArchive = $false,
     [switch]$cliOnly = $false,
     [switch]$cleanGvsbuild = $false,
-    [string]$extra = "nvidia",
-    [string]$artifactFlavor = "vulkan"
+    [string]$extra = "nvidia"
 )
 
 $global:PYINSTALLER_VERSION = "6.18.0"
@@ -61,99 +60,6 @@ function Build-SystemDependencies {
     uv pip install gvsbuild==$global:GVSBUILD_VERSION
     uv pip install patch
     uv run --no-project python -m patch -p1 -d venv_gtk_release/lib/site-packages patches/gvsbuild_ffmpeg.patch
-    @'
-from pathlib import Path
-import shutil
-
-path = Path("venv_gtk_release/Lib/site-packages/gvsbuild/projects/pkgconf.py")
-text = path.read_text(encoding="utf-8")
-text = text.replace(
-    'archive_url="https://distfiles.ariadne.space/pkgconf/pkgconf-{version}.tar.gz",',
-    'archive_url="https://github.com/pkgconf/pkgconf/archive/refs/tags/pkgconf-{version}.tar.gz",',
-)
-text = text.replace(
-    'hash="ab89d59810d9cad5dfcd508f25efab8ea0b1c8e7bad91c2b6351f13e6a5940d8",',
-    'hash="79721badcad1987dead9c3609eb4877ab9b58821c06bdacb824f2c8897c11f2a",',
-)
-path.write_text(text, encoding="utf-8")
-
-patch_src = Path("patches/gvsbuild_gobject_introspection_py313.patch")
-patch_dst = Path("venv_gtk_release/Lib/site-packages/gvsbuild/patches/gobject-introspection/002-python313-msvccompiler.patch")
-patch_dst.parent.mkdir(parents=True, exist_ok=True)
-shutil.copyfile(patch_src, patch_dst)
-
-project_path = Path("venv_gtk_release/Lib/site-packages/gvsbuild/projects/gobject_introspection.py")
-project_text = project_path.read_text(encoding="utf-8")
-needle = '                "001-incorrect-giscanner-path.patch",\n'
-replacement = (
-    '                "001-incorrect-giscanner-path.patch",\n'
-    '                "002-python313-msvccompiler.patch",\n'
-)
-if "002-python313-msvccompiler.patch" not in project_text:
-    project_text = project_text.replace(needle, replacement)
-project_path.write_text(project_text, encoding="utf-8")
-
-ffmpeg_project_path = Path("venv_gtk_release/Lib/site-packages/gvsbuild/projects/ffmpeg.py")
-ffmpeg_project_text = ffmpeg_project_path.read_text(encoding="utf-8")
-if "from pathlib import Path" not in ffmpeg_project_text:
-    ffmpeg_project_text = ffmpeg_project_text.replace(
-        "import os\n",
-        "import os\nfrom pathlib import Path\n",
-    )
-ffmpeg_needle = """    def build(self):
-        configuration = (
-            "debug-optimized"
-            if self.opts.release_configuration_is_actually_debug_optimized
-            else self.opts.configuration
-        )
-"""
-ffmpeg_replacement = """    def build(self):
-        configuration = (
-            "debug-optimized"
-            if self.opts.release_configuration_is_actually_debug_optimized
-            else self.opts.configuration
-        )
-
-        configure_path = Path(self.build_dir) / "configure"
-        if configure_path.exists():
-            configure_text = configure_path.read_text(encoding="utf-8")
-            strict_probe = (
-                '# Treat unrecognized flags as errors on MSVC\\n'
-                'test_cpp_condition windows.h "_MSC_FULL_VER >= 193030705" &&\\n'
-                '    check_cflags -options:strict\\n'
-                'test_host_cpp_condition windows.h "_MSC_FULL_VER >= 193030705" &&\\n'
-                '    check_host_cflags -options:strict\\n'
-            )
-            strict_probe_replacement = (
-                '# gvsbuild workaround: recent MSVC accepts -options:strict, but FFmpeg configure\\n'
-                '# still probes cl.exe with GCC-style -o arguments during compiler detection.\\n'
-                '# Skip the strict-flag probe so the real MSVC toolchain build can proceed.\\n'
-            )
-            if strict_probe in configure_text and 'Skip the strict-flag probe' not in configure_text:
-                configure_text = configure_text.replace(strict_probe, strict_probe_replacement)
-            localized_probe = (
-                '    elif VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft || { $_cc -v 2>&1 | grep -q clang && $_cc -? > /dev/null 2>&1; }; then\\n'
-            )
-            localized_probe_replacement = (
-                '    elif [ "$toolchain" = "msvc" ] || VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft || { $_cc -v 2>&1 | grep -q clang && $_cc -? > /dev/null 2>&1; }; then\\n'
-            )
-            if localized_probe in configure_text and '[ "$toolchain" = "msvc" ]' not in configure_text:
-                configure_text = configure_text.replace(localized_probe, localized_probe_replacement)
-            localized_ident = (
-                '        if VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft; then\\n'
-            )
-            localized_ident_replacement = (
-                '        if [ "$toolchain" = "msvc" ] || VSLANG=1033 $_cc -nologo- 2>&1 | grep -q ^Microsoft; then\\n'
-            )
-            if localized_ident in configure_text and 'if [ "$toolchain" = "msvc" ] || VSLANG=1033' not in configure_text:
-                configure_text = configure_text.replace(localized_ident, localized_ident_replacement)
-            if '[ "$toolchain" = "msvc" ]' in configure_text:
-                configure_path.write_text(configure_text, encoding="utf-8")
-"""
-if "Skip the strict-flag probe" not in ffmpeg_project_text:
-    ffmpeg_project_text = ffmpeg_project_text.replace(ffmpeg_needle, ffmpeg_replacement)
-ffmpeg_project_path.write_text(ffmpeg_project_text, encoding="utf-8")
-'@ | python -X utf8 -
     uv pip uninstall patch
 
     $cleanArgument = if ($clean) { '--clean' } else { '' }
@@ -230,9 +136,6 @@ function Install-PythonDependencies {
         uv pip install --force-reinstall (Resolve-Path ".\build_gtk_release\gtk\x64\release\python\pycairo*.whl").Path
     }
 
-    # pnnx is only needed at runtime for NCNN export paths, so keep it packaging-scoped.
-    uv pip install pnnx
-
     # pin setuptools to fix build failure of gobject-introspection. Can be removed once https://github.com/wingtk/gvsbuild/pull/1715 is released
     uv pip install pyinstaller==$global:PYINSTALLER_VERSION "setuptools<81.0.0"
 
@@ -252,12 +155,10 @@ function Create-EXE {
 
     .\venv_release_win\Scripts\Activate.ps1
 
-    if (-not $cliOnly) {
-        $release_dir = (Resolve-Path ".\build_gtk_release\gtk\x64\release").Path
-        $env:Path = $release_dir + "\bin;" + $env:Path
-        $env:LIB = $release_dir + "\lib;" + $env:LIB
-        $env:INCLUDE = $release_dir + "\include;" + $release_dir + "\include\cairo;" + $release_dir + "\include\glib-2.0;" + $release_dir + "\include\gobject-introspection-1.0;" + $release_dir + "\lib\glib-2.0\include;" + $env:INCLUDE
-    }
+    $release_dir = (Resolve-Path ".\build_gtk_release\gtk\x64\release").Path
+    $env:Path = $release_dir + "\bin;" + $env:Path
+    $env:LIB = $release_dir + "\lib;" + $env:LIB
+    $env:INCLUDE = $release_dir + "\include;" + $release_dir + "\include\cairo;" + $release_dir + "\include\glib-2.0;" + $release_dir + "\include\gobject-introspection-1.0;" + $release_dir + "\lib\glib-2.0\include;" + $env:INCLUDE
 
     $specArgs = @()
     if ($cliOnly) { $specArgs += '--cli-only' }
@@ -270,10 +171,9 @@ function Create-EXE {
 
 function Create-7ZArchive {
     param(
-        [Parameter(Mandatory)] [boolean]$cliOnly,
-        [Parameter(Mandatory)] [string]$artifactFlavor
+        [Parameter(Mandatory)] [string]$extra
     )
-    Write-Host "Creating 7z archive for artifact flavor: $artifactFlavor..."
+    Write-Host "Creating 7z archive..."
 
     .\venv_release_win\Scripts\Activate.ps1
     $version = $(uv run --no-project python -c 'import lada; print(lada.VERSION)')
@@ -281,9 +181,7 @@ function Create-7ZArchive {
 
     $env:Path = ($env:Programfiles + "\7-Zip;") + $env:Path
 
-    $archive_prefix = if ($cliOnly) { "lada-cli" } else { "lada" }
-    $archive_base = "{0}-v{1}_windows_{2}" -f $archive_prefix,$version,$artifactFlavor
-    $archive_path = "./dist/{0}.7z" -f $archive_base
+    $archive_path = "./dist/lada-v{0}_windows_{1}.7z" -f $version,$extra
 
     # Delete files from prior runs
     Get-ChildItem "./dist" -filter "*.7z*" | ForEach-Object {
@@ -296,7 +194,7 @@ function Create-7ZArchive {
     # Create single-file .7z archive
     $single_chunk = (Get-ChildItem "./dist" -filter "*.7z*" | Where-Object Name -Match '\.7z.\d{3}$' | Measure-Object).Count -eq 1
     if ($single_chunk) {
-        $old = "./dist/{0}.7z.001" -f $archive_base
+        $old = "./dist/lada-v{0}_windows_{1}.7z.001" -f $version,$extra
         $new = $archive_path
         mv $old $new
     } else {
@@ -324,14 +222,6 @@ function Check-Extra {
     }
 }
 
-function Check-ArtifactFlavor {
-    param([Parameter(Mandatory)] [string]$artifactFlavor)
-    if ([string]::IsNullOrWhiteSpace($artifactFlavor)) {
-        Write-Warning "artifactFlavor must not be empty."
-        exit 1
-    }
-}
-
 # ---------------------
 # EXECUTE PACKAGING STEPS
 # ---------------------
@@ -340,7 +230,6 @@ $ErrorActionPreference = "Stop"
 
 Check-ProjectRoot
 Check-Extra $extra
-Check-ArtifactFlavor $artifactFlavor
 
 if (-not $skipWinget) {
     Install-SystemDependencies $cliOnly
@@ -351,12 +240,12 @@ if (-not $skipWinget) {
 if (-not ($skipGvsbuild -Or $cliOnly)) {
     Build-SystemDependencies $cleanGvsbuild
 }
-if (-not ($skipTranslations -Or $cliOnly)) {
+if (-not $skipTranslations) {
     Compile-Translations
 }
 Download-ModelWeights
 Install-PythonDependencies $cliOnly $extra
 Create-EXE $cliOnly $extra
 if (-not $skipArchive) {
-    Create-7ZArchive $cliOnly $artifactFlavor
+    Create-7ZArchive $extra
 }

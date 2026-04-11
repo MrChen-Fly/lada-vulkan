@@ -15,8 +15,9 @@ if TYPE_CHECKING:
     from .frame_restorer import FrameRestorer
 
 
-_ENABLE_VULKAN_BATCH_BLEND_FAST_PATH = False
-_ENABLE_VULKAN_PREPROCESS_BLEND_FAST_PATH = False
+_ENABLE_NATIVE_BATCH_BLEND_FAST_PATH = False
+_ENABLE_NATIVE_BLEND_FAST_PATH = False
+_ENABLE_NATIVE_PADDED_BLEND_FAST_PATH = False
 
 
 def restore_frame(
@@ -30,19 +31,22 @@ def restore_frame(
     target_dtype = (
         torch.float32 if is_cpu_input else restorer.mosaic_restoration_model.dtype
     )
-    gpu_blend_patch = None
-    gpu_blend_patch_padded = None
+    native_blend_patch = None
+    native_padded_blend_patch = None
     if is_cpu_input:
         padded_candidate = getattr(
             restorer.mosaic_restoration_model,
             "blend_patch_padded",
             None,
         )
-        if _ENABLE_VULKAN_PREPROCESS_BLEND_FAST_PATH and callable(padded_candidate):
-            gpu_blend_patch_padded = padded_candidate
+        if _ENABLE_NATIVE_PADDED_BLEND_FAST_PATH and callable(padded_candidate):
+            native_padded_blend_patch = padded_candidate
         candidate = getattr(restorer.mosaic_restoration_model, "blend_patch", None)
-        if callable(candidate):
-            gpu_blend_patch = candidate
+        # Keep the Python CPU blend path as the default until the native blend
+        # bridge matches `mask_utils.create_blend_mask()` on border-touching and
+        # multi-mosaic clips. The current fast path can still emit black blocks.
+        if _ENABLE_NATIVE_BLEND_FAST_PATH and callable(candidate):
+            native_blend_patch = candidate
 
     def _blend_gpu(
         blend_mask: torch.Tensor,
@@ -85,11 +89,11 @@ def restore_frame(
         clip_img, clip_mask, orig_clip_box, orig_crop_shape, pad_after_resize = (
             buffered_clip.pop()
         )
-        if gpu_blend_patch_padded is not None:
+        if native_padded_blend_patch is not None:
             top, left, bottom, right = orig_clip_box
             frame_roi = frame[top : bottom + 1, left : right + 1, :]
-            with restorer.profiler.measure("frame_blend_vulkan_s"):
-                blended_roi = gpu_blend_patch_padded(
+            with restorer.profiler.measure("frame_blend_native_s"):
+                blended_roi = native_padded_blend_patch(
                     frame_roi,
                     clip_img,
                     clip_mask,
@@ -113,11 +117,11 @@ def restore_frame(
                 orig_crop_shape[:2],
                 interpolation=cv2.INTER_NEAREST,
             )
-        if gpu_blend_patch is not None:
+        if native_blend_patch is not None:
             top, left, bottom, right = orig_clip_box
             frame_roi = frame[top : bottom + 1, left : right + 1, :]
-            with restorer.profiler.measure("frame_blend_vulkan_s"):
-                blended_roi = gpu_blend_patch(frame_roi, clip_img, clip_mask)
+            with restorer.profiler.measure("frame_blend_native_s"):
+                blended_roi = native_blend_patch(frame_roi, clip_img, clip_mask)
             with restorer.profiler.measure("frame_blend_apply_s"):
                 if (
                     blended_roi is not frame_roi
@@ -145,9 +149,9 @@ def maybe_batch_blend_single_clip_run(
     clip_index: dict[int, list[Clip]],
     frame_buffer: dict[int, tuple[int, Image | ImageTensor, int]],
 ) -> list[tuple[Image | ImageTensor, int]] | None:
-    # Keep the single-frame Vulkan preprocess blend path as the safe default until
+    # Keep the single-frame native padded-blend path as the safe default until
     # the batched path matches the reference output on full videos.
-    if not _ENABLE_VULKAN_BATCH_BLEND_FAST_PATH:
+    if not _ENABLE_NATIVE_BATCH_BLEND_FAST_PATH:
         return None
 
     batch_blend_fn = getattr(
@@ -199,7 +203,7 @@ def maybe_batch_blend_single_clip_run(
         clip_masks.append(clip_mask)
         pad_after_resizes.append(pad_after_resize)
 
-    with restorer.profiler.measure("frame_blend_vulkan_s"):
+    with restorer.profiler.measure("frame_blend_native_s"):
         batch_blend_fn(frame_rois, clip_imgs, clip_masks, pad_after_resizes)
 
     for future_num in future_frame_nums:

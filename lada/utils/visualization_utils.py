@@ -4,7 +4,7 @@
 import cv2
 import torch
 from lada.utils import image_utils
-from lada.restorationpipeline.clip_units import Clip
+from lada.restorationpipeline.mosaic_detector import Clip
 
 def overlay_mask(frame, mask):
     overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)

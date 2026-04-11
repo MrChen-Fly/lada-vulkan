@@ -10,14 +10,13 @@ from lada.compute_targets import (
     get_compute_target,
     normalize_compute_target_id,
 )
+from lada.extensions.runtime_registry import get_runtime_extension
 from .basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
-from .basicvsrpp_vulkan_common import (
-    _MODULAR_FRAME_COUNT,
+from .runtime_options import (
+    RestorationRuntimeFeatures,
+    RestorationSchedulingOptions,
 )
-from .basicvsrpp_vulkan_restorer import (
-    NcnnVulkanBasicvsrppMosaicRestorer,
-)
-from lada.utils import ImageTensor
+from lada.utils import Image, ImageTensor
 
 
 @runtime_checkable
@@ -25,7 +24,17 @@ class MosaicRestorationModel(Protocol):
     runtime: str
     dtype: torch.dtype
 
-    def restore(self, video: list[ImageTensor], max_frames: int = -1) -> list[ImageTensor]:
+    def restore(
+        self,
+        video: list[Image | ImageTensor],
+        max_frames: int = -1,
+    ) -> list[Image | ImageTensor]:
+        ...
+
+    def get_runtime_scheduling_options(self) -> RestorationSchedulingOptions:
+        ...
+
+    def get_runtime_features(self) -> RestorationRuntimeFeatures:
         ...
 
     def release_cached_memory(self) -> None:
@@ -71,20 +80,16 @@ def build_mosaic_restoration_model(
 
         raise NotImplementedError()
 
-    if target.runtime == "vulkan":
-        if not model_name.startswith("basicvsrpp"):
-            raise UnsupportedComputeTargetError(
-                "Vulkan restoration backend currently supports BasicVSR++ models only."
-            )
-        return (
-            NcnnVulkanBasicvsrppMosaicRestorer(
-                model_path,
-                config_path=config_path,
-                fp16=fp16,
-                frame_count=_MODULAR_FRAME_COUNT,
-                artifacts_dir=artifacts_dir,
-            ),
-            "zero",
+    extension = get_runtime_extension(target.runtime)
+    if extension is not None and extension.build_restoration_model is not None:
+        return extension.build_restoration_model(
+            model_name=model_name,
+            model_path=model_path,
+            config_path=config_path,
+            compute_target_id=normalized_target_id,
+            torch_device=torch_device,
+            fp16=fp16,
+            artifacts_dir=artifacts_dir,
         )
 
     raise UnsupportedComputeTargetError(

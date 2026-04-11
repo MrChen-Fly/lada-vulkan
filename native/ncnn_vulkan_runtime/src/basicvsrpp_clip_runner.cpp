@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -72,6 +73,7 @@ struct ModuleArtifacts
 const char* kQuarterDownsample = "quarter_downsample";
 const char* kFeatExtract = "feat_extract";
 const char* kSpyNet = "spynet";
+const char* kSpyNetPatch = "spynet_patch";
 const char* kBackward1 = "backward_1";
 const char* kForward1 = "forward_1";
 const char* kBackward2 = "backward_2";
@@ -92,6 +94,14 @@ const std::vector<std::string> kRequiredModules = {
     "forward_2_step",
     kOutputFrame,
 };
+
+bool basicvsrpp_module_uses_fp16(const std::string& module_name, bool requested_fp16)
+{
+    if (!requested_fp16) {
+        return false;
+    }
+    return module_name != kSpyNet && module_name != kSpyNetPatch;
+}
 
 #if NCNN_BENCHMARK
 constexpr std::size_t kOutputFrameDownloadChunkSize = 2;
@@ -178,7 +188,7 @@ int reflect_coord(int coord, int limit)
 
     while (coord < 0 || coord >= limit)
     {
-        coord = coord < 0 ? -coord - 1 : 2 * limit - coord - 1;
+        coord = coord < 0 ? -coord : 2 * limit - coord - 2;
     }
     return coord;
 }
@@ -232,6 +242,84 @@ void main()
 }
 )";
 
+static const char kBasicVsrppTensorResizeShader[] = R"(
+#version 450
+
+layout(binding = 0) readonly buffer input_blob { sfp input_blob_data[]; };
+layout(binding = 1) writeonly buffer output_blob { sfp output_blob_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int src_w;
+    int src_h;
+    int dst_w;
+    int dst_h;
+    int channels;
+    int input_cstep;
+    int output_cstep;
+    float channel0_scale;
+    float channel1_scale;
+} p;
+
+float input_value_at(int channel, int x, int y)
+{
+    return float(buffer_ld1(input_blob_data, channel * p.input_cstep + y * p.src_w + x));
+}
+
+void output_store(int channel, int x, int y, float value)
+{
+    buffer_st1(output_blob_data, channel * p.output_cstep + y * p.dst_w + x, afp(value));
+}
+
+float sample_resized_value(int channel, int x, int y)
+{
+    if (p.src_w == 1 && p.src_h == 1)
+        return input_value_at(channel, 0, 0);
+
+    const float src_x = clamp(
+        (float(x) + 0.5) * float(p.src_w) / float(p.dst_w) - 0.5,
+        0.0,
+        float(max(p.src_w - 1, 0)));
+    const float src_y = clamp(
+        (float(y) + 0.5) * float(p.src_h) / float(p.dst_h) - 0.5,
+        0.0,
+        float(max(p.src_h - 1, 0)));
+
+    const int x0 = min(int(floor(src_x)), p.src_w - 1);
+    const int y0 = min(int(floor(src_y)), p.src_h - 1);
+    const int x1 = min(x0 + 1, p.src_w - 1);
+    const int y1 = min(y0 + 1, p.src_h - 1);
+    const float lx = src_x - float(x0);
+    const float ly = src_y - float(y0);
+    const float hx = 1.0 - lx;
+    const float hy = 1.0 - ly;
+
+    const float v00 = input_value_at(channel, x0, y0);
+    const float v01 = input_value_at(channel, x1, y0);
+    const float v10 = input_value_at(channel, x0, y1);
+    const float v11 = input_value_at(channel, x1, y1);
+    const float top = v00 * hx + v01 * lx;
+    const float bottom = v10 * hx + v11 * lx;
+    return top * hy + bottom * ly;
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    const int channel = int(gl_GlobalInvocationID.z);
+    if (x >= p.dst_w || y >= p.dst_h || channel >= p.channels)
+        return;
+
+    float value = sample_resized_value(channel, x, y);
+    if (channel == 0)
+        value *= p.channel0_scale;
+    else if (channel == 1)
+        value *= p.channel1_scale;
+    output_store(channel, x, y, value);
+}
+)";
+
 struct PackedBgrFrame
 {
     int width = 0;
@@ -251,6 +339,27 @@ struct PackedBgrResizeFrame
     int pad_top = 0;
     int pad_mode = 0;
     ncnn::Mat packed_input;
+};
+
+struct ClipDebugTrace
+{
+    std::vector<ncnn::Mat> lqs;
+    std::vector<ncnn::Mat> quarter_downsample;
+    std::vector<ncnn::Mat> feat_extract;
+    std::vector<ncnn::Mat> flows_backward;
+    std::vector<ncnn::Mat> flows_forward;
+    std::vector<ncnn::Mat> backward_1;
+    std::vector<ncnn::Mat> forward_1;
+    std::vector<ncnn::Mat> backward_2;
+    std::vector<ncnn::Mat> forward_2;
+    std::vector<ncnn::Mat> output_frame;
+};
+
+struct FlowRunSpec
+{
+    std::string runner_name;
+    int runtime_height = 0;
+    int runtime_width = 0;
 };
 
 ModuleArtifacts parse_module_artifacts(const py::handle& value)
@@ -334,6 +443,8 @@ struct ModuleContext
     ncnn::VkAllocator* staging_vkallocator = nullptr;
 };
 
+ncnn::Mat tight_cpu_clone(const ncnn::Mat& output);
+
 class ModuleRunner
 {
 public:
@@ -342,7 +453,8 @@ public:
         const ModuleArtifacts& artifacts,
         bool fp16,
         int num_threads)
-        : module_name_(std::move(module_name))
+        : module_name_(std::move(module_name)),
+          module_fp16_(basicvsrpp_module_uses_fp16(module_name_, fp16))
     {
         auto net = std::make_unique<ncnn::Net>();
         int ret = lada::register_torchvision_deform_conv2d_layers(*net);
@@ -358,9 +470,9 @@ public:
 
         net->set_vulkan_device(0);
         net->opt.use_vulkan_compute = true;
-        net->opt.use_fp16_storage = fp16;
-        net->opt.use_fp16_packed = fp16;
-        net->opt.use_fp16_arithmetic = fp16;
+        net->opt.use_fp16_storage = module_fp16_;
+        net->opt.use_fp16_packed = module_fp16_;
+        net->opt.use_fp16_arithmetic = module_fp16_;
         net->opt.num_threads = std::max(num_threads, 1);
 
         if (net->load_param(artifacts.param_path.c_str()) != 0) {
@@ -381,7 +493,10 @@ public:
         ncnn::VkCompute extract_cmd(context_->vkdev);
         std::vector<ncnn::Extractor> extractors;
         extractors.reserve(1);
-        ncnn::VkMat output = record_to_gpu(inputs, extract_cmd, extractors, output_name);
+        std::vector<ncnn::VkMat> bridged_inputs;
+        bridged_inputs.reserve(inputs.size());
+        ncnn::VkMat output =
+            record_to_gpu(inputs, extract_cmd, extractors, bridged_inputs, output_name);
         const int ret = extract_cmd.submit_and_wait();
         if (ret == 0) {
             lada::finalize_native_op_gpu_profile(extract_cmd, context_->vkdev);
@@ -398,6 +513,7 @@ public:
         const NamedValues& inputs,
         ncnn::VkCompute& extract_cmd,
         std::vector<ncnn::Extractor>& extractors,
+        std::vector<ncnn::VkMat>& bridged_inputs,
         const std::string& output_name = "out0") const
     {
         clip_trace(
@@ -407,7 +523,7 @@ public:
             inputs.size());
         extractors.push_back(context_->create_extractor(true));
         ncnn::Extractor& extractor = extractors.back();
-        feed_inputs(extractor, inputs);
+        feed_inputs(extractor, inputs, extract_cmd, bridged_inputs);
 
         ncnn::VkMat extracted_output;
         const int ret = extractor.extract(output_name.c_str(), extracted_output, extract_cmd);
@@ -424,10 +540,27 @@ public:
 
     ncnn::Mat run_to_cpu(const NamedValues& inputs, const std::string& output_name = "out0") const
     {
-        ncnn::Extractor extractor = context_->create_extractor(true);
-        feed_inputs(extractor, inputs);
+        ncnn::Option opt = make_gpu_option();
+        ncnn::VkCompute extract_cmd(context_->vkdev);
+        std::vector<ncnn::Extractor> extractors;
+        extractors.reserve(1);
+        std::vector<ncnn::VkMat> bridged_inputs;
+        bridged_inputs.reserve(inputs.size());
+        const ncnn::VkMat output =
+            record_to_gpu(inputs, extract_cmd, extractors, bridged_inputs, output_name);
 
-        return extract_cpu_output(extractor, output_name);
+        ncnn::Mat cpu_output;
+        extract_cmd.record_download(output, cpu_output, opt);
+        const int ret = extract_cmd.submit_and_wait();
+        if (ret == 0) {
+            lada::finalize_native_op_gpu_profile(extract_cmd, context_->vkdev);
+        }
+        if (ret != 0) {
+            throw std::runtime_error(
+                "Failed to download CPU tensor from module '" + module_name_ + "'.");
+        }
+
+        return unpack_cpu_output(std::move(cpu_output));
     }
 
     std::vector<ncnn::Mat> run_many_to_cpu(
@@ -452,12 +585,19 @@ public:
             ncnn::VkCompute extract_cmd(context_->vkdev);
             std::vector<ncnn::Extractor> extractors;
             extractors.reserve(chunk_end - chunk_begin);
+            std::vector<ncnn::VkMat> bridged_inputs;
+            bridged_inputs.reserve((chunk_end - chunk_begin) * 8);
 
             std::vector<ncnn::VkMat> outputs;
             outputs.reserve(chunk_end - chunk_begin);
             for (std::size_t input_index = chunk_begin; input_index < chunk_end; ++input_index) {
                 outputs.push_back(
-                    record_to_gpu(inputs_batch[input_index], extract_cmd, extractors, output_name));
+                    record_to_gpu(
+                        inputs_batch[input_index],
+                        extract_cmd,
+                        extractors,
+                        bridged_inputs,
+                        output_name));
             }
 
             for (std::size_t output_index = 0; output_index < outputs.size(); ++output_index) {
@@ -495,6 +635,22 @@ public:
     }
 
 private:
+    static int resolve_vk_cast_type(const ncnn::VkMat& value)
+    {
+        if (value.elempack <= 0) {
+            return 0;
+        }
+
+        const size_t scalar_elemsize = value.elemsize / static_cast<size_t>(value.elempack);
+        if (scalar_elemsize == 4u) {
+            return 1;
+        }
+        if (scalar_elemsize == 2u) {
+            return 2;
+        }
+        return 0;
+    }
+
     ncnn::Option make_gpu_option() const
     {
         ncnn::Option opt = context_->net->opt;
@@ -505,18 +661,41 @@ private:
         return opt;
     }
 
-    ncnn::Mat extract_cpu_output(
-        ncnn::Extractor& extractor,
-        const std::string& output_name) const
+    bool needs_vk_precision_bridge(const ncnn::VkMat& input) const
     {
-        ncnn::Mat output;
-        const int ret = extractor.extract(output_name.c_str(), output);
-        if (ret != 0) {
-            throw std::runtime_error(
-                "Failed to extract CPU tensor from module '" + module_name_ + "'.");
+        const int source_cast_type = resolve_vk_cast_type(input);
+        if (source_cast_type == 0) {
+            return false;
+        }
+        const int target_cast_type = module_fp16_ ? 2 : 1;
+        return source_cast_type != target_cast_type;
+    }
+
+    ncnn::VkMat bridge_vk_input(
+        const ncnn::VkMat& input,
+        ncnn::VkCompute& extract_cmd,
+        std::vector<ncnn::VkMat>& bridged_inputs) const
+    {
+        if (!needs_vk_precision_bridge(input)) {
+            return input;
         }
 
-        return unpack_cpu_output(std::move(output));
+        ncnn::Option bridge_opt = make_gpu_option();
+        ncnn::VkMat bridged_input;
+        context_->vkdev->convert_packing(
+            input,
+            bridged_input,
+            input.elempack,
+            module_fp16_ ? 2 : 1,
+            extract_cmd,
+            bridge_opt);
+        if (bridged_input.empty()) {
+            throw std::runtime_error(
+                "Failed to bridge Vulkan tensor precision for module '" + module_name_ + "'.");
+        }
+
+        bridged_inputs.push_back(bridged_input);
+        return bridged_inputs.back();
     }
 
     ncnn::Mat unpack_cpu_output(ncnn::Mat output) const
@@ -531,10 +710,27 @@ private:
             output = std::move(unpacked_output);
         }
 
-        return output.clone();
+        if (output.elemsize == 2u) {
+            ncnn::Option cast_opt = context_->net->opt;
+            cast_opt.use_vulkan_compute = false;
+            cast_opt.use_packing_layout = false;
+            cast_opt.use_fp16_storage = false;
+            cast_opt.use_fp16_packed = false;
+            cast_opt.use_fp16_arithmetic = false;
+
+            ncnn::Mat float_output;
+            ncnn::cast_float16_to_float32(output, float_output, cast_opt);
+            output = std::move(float_output);
+        }
+
+        return tight_cpu_clone(output);
     }
 
-    void feed_inputs(ncnn::Extractor& extractor, const NamedValues& inputs) const
+    void feed_inputs(
+        ncnn::Extractor& extractor,
+        const NamedValues& inputs,
+        ncnn::VkCompute& extract_cmd,
+        std::vector<ncnn::VkMat>& bridged_inputs) const
     {
         for (const auto& entry : inputs) {
             const std::string& blob_name = entry.first;
@@ -542,7 +738,12 @@ private:
             if (std::holds_alternative<ncnn::Mat>(entry.second)) {
                 ret = extractor.input(blob_name.c_str(), std::get<ncnn::Mat>(entry.second));
             } else {
-                ret = extractor.input(blob_name.c_str(), std::get<ncnn::VkMat>(entry.second));
+                ret = extractor.input(
+                    blob_name.c_str(),
+                    bridge_vk_input(
+                        std::get<ncnn::VkMat>(entry.second),
+                        extract_cmd,
+                        bridged_inputs));
             }
 
             if (ret != 0) {
@@ -553,6 +754,7 @@ private:
     }
 
     std::string module_name_;
+    bool module_fp16_ = false;
     std::shared_ptr<ModuleContext> context_;
 };
 
@@ -572,10 +774,52 @@ ncnn::Mat py_array_to_ncnn_mat(
     return mat;
 }
 
+ncnn::Mat tight_cpu_clone(const ncnn::Mat& output)
+{
+    const size_t packed_elemsize = output.elemsize * static_cast<size_t>(output.elempack);
+
+    if (output.dims == 3) {
+        ncnn::Mat tight(output.w, output.h, output.c, output.elemsize, output.elempack);
+        if (tight.empty()) {
+            throw std::runtime_error("Failed to allocate tight CPU clone for BasicVSR++ output.");
+        }
+        const size_t channel_bytes =
+            static_cast<size_t>(output.w) * static_cast<size_t>(output.h) * packed_elemsize;
+        for (int channel_index = 0; channel_index < output.c; ++channel_index) {
+            std::memcpy(tight.channel(channel_index), output.channel(channel_index), channel_bytes);
+        }
+        return tight;
+    }
+
+    if (output.dims == 2) {
+        ncnn::Mat tight(output.w, output.h, output.elemsize, output.elempack);
+        if (tight.empty()) {
+            throw std::runtime_error("Failed to allocate tight CPU clone for BasicVSR++ output.");
+        }
+        const size_t total_bytes =
+            static_cast<size_t>(output.w) * static_cast<size_t>(output.h) * packed_elemsize;
+        std::memcpy(tight.data, output.data, total_bytes);
+        return tight;
+    }
+
+    if (output.dims == 1) {
+        ncnn::Mat tight(output.w, output.elemsize, output.elempack);
+        if (tight.empty()) {
+            throw std::runtime_error("Failed to allocate tight CPU clone for BasicVSR++ output.");
+        }
+        const size_t total_bytes = static_cast<size_t>(output.w) * packed_elemsize;
+        std::memcpy(tight.data, output.data, total_bytes);
+        return tight;
+    }
+
+    return output.clone();
+}
+
 py::array_t<float> ncnn_mat_to_py_array(const ncnn::Mat& mat)
 {
-    if (mat.dims != 3 || mat.elempack != 1) {
-        throw std::runtime_error("BasicVsrppClipRunner can only return unpacked 3D tensors.");
+    if (mat.dims != 3 || mat.elempack != 1 || mat.elemsize != sizeof(float)) {
+        throw std::runtime_error(
+            "BasicVsrppClipRunner can only return unpacked float32 3D tensors.");
     }
 
     py::array_t<float> output({mat.c, mat.h, mat.w});
@@ -589,6 +833,137 @@ py::array_t<float> ncnn_mat_to_py_array(const ncnn::Mat& mat)
             plane_size * sizeof(float));
     }
     return output;
+}
+
+py::list ncnn_mats_to_py_list(const std::vector<ncnn::Mat>& mats)
+{
+    py::list result;
+    for (const ncnn::Mat& mat : mats) {
+        result.append(ncnn_mat_to_py_array(mat));
+    }
+    return result;
+}
+
+ncnn::Mat unpack_cpu_output(ncnn::Mat output, const ncnn::Option& opt)
+{
+    if (output.elempack != 1) {
+        ncnn::Option unpack_opt = opt;
+        unpack_opt.use_vulkan_compute = false;
+        unpack_opt.use_packing_layout = false;
+
+        ncnn::Mat unpacked_output;
+        ncnn::convert_packing(output, unpacked_output, 1, unpack_opt);
+        output = std::move(unpacked_output);
+    }
+
+    if (output.elemsize == 2u) {
+        ncnn::Option cast_opt = opt;
+        cast_opt.use_vulkan_compute = false;
+        cast_opt.use_packing_layout = false;
+        cast_opt.use_fp16_storage = false;
+        cast_opt.use_fp16_packed = false;
+        cast_opt.use_fp16_arithmetic = false;
+
+        ncnn::Mat float_output;
+        ncnn::cast_float16_to_float32(output, float_output, cast_opt);
+        output = std::move(float_output);
+    }
+
+    return output.clone();
+}
+
+std::vector<ncnn::Mat> download_vk_outputs(
+    const std::vector<ncnn::VkMat>& outputs,
+    const ModuleRunner& runner)
+{
+    if (outputs.empty()) {
+        return {};
+    }
+
+    ncnn::Option opt = runner.gpu_option();
+    ncnn::VkCompute cmd(runner.vkdev());
+    std::vector<ncnn::Mat> cpu_outputs(outputs.size());
+    for (std::size_t output_index = 0; output_index < outputs.size(); ++output_index) {
+        cmd.record_download(outputs[output_index], cpu_outputs[output_index], opt);
+    }
+
+    const int ret = cmd.submit_and_wait();
+    if (ret != 0) {
+        throw std::runtime_error("Failed to download BasicVSR++ debug trace tensors.");
+    }
+    lada::finalize_native_op_gpu_profile(cmd, runner.vkdev());
+
+    for (std::size_t output_index = 0; output_index < cpu_outputs.size(); ++output_index) {
+        cpu_outputs[output_index] = unpack_cpu_output(std::move(cpu_outputs[output_index]), opt);
+    }
+    return cpu_outputs;
+}
+
+std::vector<ncnn::Mat> download_preprocessed_vk_outputs_as_float32(
+    const std::vector<ncnn::VkMat>& outputs,
+    const ModuleRunner& runner)
+{
+    if (outputs.empty()) {
+        return {};
+    }
+
+    ncnn::Option opt = runner.gpu_option();
+    opt.use_packing_layout = false;
+    opt.use_fp16_storage = false;
+    opt.use_fp16_packed = false;
+    opt.use_fp16_arithmetic = false;
+    opt.use_bf16_storage = false;
+    opt.use_bf16_packed = false;
+
+    ncnn::VkCompute cmd(runner.vkdev());
+    std::vector<ncnn::Mat> cpu_outputs(outputs.size());
+    for (std::size_t output_index = 0; output_index < outputs.size(); ++output_index) {
+        cmd.record_download(outputs[output_index], cpu_outputs[output_index], opt);
+    }
+
+    const int ret = cmd.submit_and_wait();
+    if (ret != 0) {
+        throw std::runtime_error("Failed to materialize BasicVSR++ preprocess tensors.");
+    }
+    lada::finalize_native_op_gpu_profile(cmd, runner.vkdev());
+
+    for (std::size_t output_index = 0; output_index < cpu_outputs.size(); ++output_index) {
+        cpu_outputs[output_index] = unpack_cpu_output(std::move(cpu_outputs[output_index]), opt);
+    }
+    return cpu_outputs;
+}
+
+std::vector<ncnn::Mat> download_module_values(
+    const std::vector<ModuleValue>& values,
+    const ModuleRunner& runner)
+{
+    if (values.empty()) {
+        return {};
+    }
+
+    std::vector<ncnn::Mat> cpu_outputs;
+    cpu_outputs.reserve(values.size());
+    std::vector<ncnn::VkMat> vk_outputs;
+    vk_outputs.reserve(values.size());
+    bool has_vk_values = false;
+
+    for (const ModuleValue& value : values) {
+        if (std::holds_alternative<ncnn::Mat>(value)) {
+            cpu_outputs.push_back(std::get<ncnn::Mat>(value).clone());
+            continue;
+        }
+        has_vk_values = true;
+        vk_outputs.push_back(std::get<ncnn::VkMat>(value));
+    }
+
+    if (!has_vk_values) {
+        return cpu_outputs;
+    }
+    if (vk_outputs.size() != values.size()) {
+        throw std::runtime_error(
+            "BasicVsrppClipRunner debug trace does not support mixed CPU/Vulkan module inputs.");
+    }
+    return download_vk_outputs(vk_outputs, runner);
 }
 
 ncnn::Mat zeros_like_vkmat(const ncnn::VkMat& value)
@@ -719,8 +1094,28 @@ public:
     BasicVsrppClipRunner(
         const std::unordered_map<std::string, ModuleArtifacts>& module_artifacts,
         bool fp16,
-        int num_threads)
+        int num_threads,
+        const std::vector<int>& spynet_patch_shape,
+        const std::vector<int>& spynet_core_shape)
+        : fp16_(fp16)
     {
+        if (!spynet_patch_shape.empty()) {
+            if (spynet_patch_shape.size() != 2 || spynet_patch_shape[0] <= 0 || spynet_patch_shape[1] <= 0) {
+                throw std::runtime_error(
+                    "BasicVsrppClipRunner spynet_patch_shape must be [height, width].");
+            }
+            spynet_patch_height_ = spynet_patch_shape[0];
+            spynet_patch_width_ = spynet_patch_shape[1];
+        }
+        if (!spynet_core_shape.empty()) {
+            if (spynet_core_shape.size() != 2 || spynet_core_shape[0] <= 0 || spynet_core_shape[1] <= 0) {
+                throw std::runtime_error(
+                    "BasicVsrppClipRunner spynet_core_shape must be [height, width].");
+            }
+            spynet_core_height_ = spynet_core_shape[0];
+            spynet_core_width_ = spynet_core_shape[1];
+        }
+
         for (const std::string& module_name : kRequiredModules) {
             const auto it = module_artifacts.find(module_name);
             if (it == module_artifacts.end()) {
@@ -731,6 +1126,17 @@ public:
                 module_name,
                 std::make_unique<ModuleRunner>(module_name, it->second, fp16, num_threads));
         }
+
+        const auto spynet_patch_it = module_artifacts.find(kSpyNetPatch);
+        if (spynet_patch_it != module_artifacts.end()) {
+            runners_.emplace(
+                kSpyNetPatch,
+                std::make_unique<ModuleRunner>(
+                    kSpyNetPatch,
+                    spynet_patch_it->second,
+                    fp16,
+                    num_threads));
+        }
     }
 
     ~BasicVsrppClipRunner()
@@ -739,6 +1145,8 @@ public:
         frame_preprocess_pipeline_ = nullptr;
         delete frame_resize_preprocess_pipeline_;
         frame_resize_preprocess_pipeline_ = nullptr;
+        delete tensor_resize_pipeline_;
+        tensor_resize_pipeline_ = nullptr;
     }
 
     std::vector<ncnn::Mat> restore(const std::vector<ncnn::Mat>& lqs) const
@@ -761,14 +1169,10 @@ public:
         clip_trace("[clip] restore_bgr_u8 begin frames=%zu\n", frames.size());
         reset_last_profile();
         const auto preprocess_started_at = SteadyClock::now();
-        const std::vector<ncnn::VkMat> preprocessed_frames = preprocess_packed_bgr_frames(frames);
+        const std::vector<ModuleValue> runtime_lqs =
+            build_runtime_lqs_from_preprocessed_frames(preprocess_packed_bgr_frames(frames));
         set_last_profile_duration("input_preprocess_s", elapsed_seconds(preprocess_started_at));
-        clip_trace("[clip] restore_bgr_u8 preprocessed=%zu\n", preprocessed_frames.size());
-        std::vector<ModuleValue> runtime_lqs;
-        runtime_lqs.reserve(preprocessed_frames.size());
-        for (const ncnn::VkMat& frame : preprocessed_frames) {
-            runtime_lqs.emplace_back(frame);
-        }
+        clip_trace("[clip] restore_bgr_u8 preprocessed=%zu\n", runtime_lqs.size());
         std::vector<ncnn::Mat> outputs = restore_impl(runtime_lqs);
         clip_trace("[clip] restore_bgr_u8 done\n");
         return outputs;
@@ -779,13 +1183,9 @@ public:
     {
         reset_last_profile();
         const auto preprocess_started_at = SteadyClock::now();
-        const std::vector<ncnn::VkMat> preprocessed_frames = preprocess_packed_bgr_frames_resized(frames);
+        const std::vector<ModuleValue> runtime_lqs =
+            build_runtime_lqs_from_preprocessed_frames(preprocess_packed_bgr_frames_resized(frames));
         set_last_profile_duration("input_preprocess_s", elapsed_seconds(preprocess_started_at));
-        std::vector<ModuleValue> runtime_lqs;
-        runtime_lqs.reserve(preprocessed_frames.size());
-        for (const ncnn::VkMat& frame : preprocessed_frames) {
-            runtime_lqs.emplace_back(frame);
-        }
         return restore_impl(runtime_lqs);
     }
 
@@ -798,7 +1198,153 @@ public:
         return profile;
     }
 
+    ClipDebugTrace debug_trace(const std::vector<ncnn::Mat>& lqs) const
+    {
+        reset_last_profile();
+        std::vector<ModuleValue> runtime_lqs;
+        runtime_lqs.reserve(lqs.size());
+        for (const ncnn::Mat& lq : lqs) {
+            runtime_lqs.emplace_back(lq);
+        }
+        return debug_trace_impl(runtime_lqs);
+    }
+
+    ClipDebugTrace debug_trace_bgr_u8_resized(
+        const std::vector<PackedBgrResizeFrame>& frames) const
+    {
+        reset_last_profile();
+        const std::vector<ModuleValue> runtime_lqs =
+            build_runtime_lqs_from_preprocessed_frames(preprocess_packed_bgr_frames_resized(frames));
+        return debug_trace_impl(runtime_lqs);
+    }
+
 private:
+    std::vector<ModuleValue> build_runtime_lqs_from_preprocessed_frames(
+        const std::vector<ncnn::VkMat>& preprocessed_frames) const
+    {
+        std::vector<ModuleValue> runtime_lqs;
+        runtime_lqs.reserve(preprocessed_frames.size());
+        if (!fp16_) {
+            for (const ncnn::VkMat& frame : preprocessed_frames) {
+                runtime_lqs.emplace_back(frame);
+            }
+            return runtime_lqs;
+        }
+
+        // fp16 module graphs stay stable only when these external preprocess outputs
+        // follow the same float32 materialization bridge as restore(lqs).
+        const std::vector<ncnn::Mat> materialized_lqs =
+            download_preprocessed_vk_outputs_as_float32(
+                preprocessed_frames,
+                runner(kQuarterDownsample));
+        for (const ncnn::Mat& frame : materialized_lqs) {
+            runtime_lqs.emplace_back(frame);
+        }
+        return runtime_lqs;
+    }
+
+    ClipDebugTrace debug_trace_impl(const std::vector<ModuleValue>& lqs) const
+    {
+        if (lqs.size() < 2) {
+            throw std::runtime_error("BasicVsrppClipRunner expects at least two frames.");
+        }
+
+        ClipDebugTrace trace;
+        std::vector<ncnn::VkMat> lqs_downsampled;
+        std::vector<ncnn::VkMat> spatial_feats;
+        lqs_downsampled.reserve(lqs.size());
+        spatial_feats.reserve(lqs.size());
+
+        std::vector<ncnn::VkMat> flows_backward;
+        std::vector<ncnn::VkMat> flows_forward;
+        flows_backward.reserve(lqs.size() - 1);
+        flows_forward.reserve(lqs.size() - 1);
+
+        {
+            ncnn::VkCompute preprocess_cmd(runner(kQuarterDownsample).vkdev());
+            std::vector<ncnn::Extractor> preprocess_extractors;
+            preprocess_extractors.reserve(lqs.size() * 2 + (lqs.size() - 1) * 2);
+            std::vector<ncnn::VkMat> preprocess_bridged_inputs;
+            preprocess_bridged_inputs.reserve(lqs.size() * 4 + (lqs.size() - 1) * 4);
+            std::vector<ncnn::VkMat> preprocess_kept_tensors;
+            preprocess_kept_tensors.reserve(lqs.size() * 6 + (lqs.size() - 1) * 8);
+
+            for (const ModuleValue& current_lq : lqs) {
+                lqs_downsampled.push_back(
+                    runner(kQuarterDownsample).record_to_gpu(
+                        {{"in0", current_lq}},
+                        preprocess_cmd,
+                        preprocess_extractors,
+                        preprocess_bridged_inputs));
+                spatial_feats.push_back(
+                    runner(kFeatExtract).record_to_gpu(
+                        {{"in0", current_lq}},
+                        preprocess_cmd,
+                        preprocess_extractors,
+                        preprocess_bridged_inputs));
+            }
+
+            for (size_t index = 0; index + 1 < lqs_downsampled.size(); ++index) {
+                const auto flow_pair = record_flow_pair(
+                    lqs_downsampled[index],
+                    lqs_downsampled[index + 1],
+                    preprocess_cmd,
+                    preprocess_extractors,
+                    preprocess_bridged_inputs,
+                    preprocess_kept_tensors);
+                flows_backward.push_back(flow_pair.first);
+                flows_forward.push_back(flow_pair.second);
+            }
+
+            if (preprocess_cmd.submit_and_wait() != 0) {
+                throw std::runtime_error("Failed to submit preprocess Vulkan subgraph.");
+            }
+            lada::finalize_native_op_gpu_profile(preprocess_cmd, runner(kQuarterDownsample).vkdev());
+        }
+
+        // Download each stage as soon as it is produced. Later recurrent/output passes may reuse
+        // the same Vulkan allocators, so keeping only VkMat handles until the end can expose
+        // mutated debug values even when the compute path itself is correct.
+        trace.lqs = download_module_values(lqs, runner(kQuarterDownsample));
+        trace.quarter_downsample = download_vk_outputs(lqs_downsampled, runner(kQuarterDownsample));
+        trace.feat_extract = download_vk_outputs(spatial_feats, runner(kFeatExtract));
+        trace.flows_backward = download_vk_outputs(flows_backward, runner(kSpyNet));
+        trace.flows_forward = download_vk_outputs(flows_forward, runner(kSpyNet));
+
+        std::unordered_map<std::string, std::vector<ncnn::VkMat>> branch_feats;
+        const std::vector<ncnn::VkMat> backward_1 =
+            run_branch(kBackward1, spatial_feats, branch_feats, flows_backward);
+        branch_feats.emplace(kBackward1, backward_1);
+        const std::vector<ncnn::VkMat> forward_1 =
+            run_branch(kForward1, spatial_feats, branch_feats, flows_forward);
+        branch_feats.emplace(kForward1, forward_1);
+        const std::vector<ncnn::VkMat> backward_2 =
+            run_branch(kBackward2, spatial_feats, branch_feats, flows_backward);
+        branch_feats.emplace(kBackward2, backward_2);
+        const std::vector<ncnn::VkMat> forward_2 =
+            run_branch(kForward2, spatial_feats, branch_feats, flows_forward);
+        branch_feats.emplace(kForward2, forward_2);
+
+        trace.backward_1 = download_vk_outputs(backward_1, runner(std::string(kBackward1) + "_backbone"));
+        trace.forward_1 = download_vk_outputs(forward_1, runner(std::string(kForward1) + "_backbone"));
+        trace.backward_2 = download_vk_outputs(backward_2, runner(std::string(kBackward2) + "_backbone"));
+        trace.forward_2 = download_vk_outputs(forward_2, runner(std::string(kForward2) + "_backbone"));
+
+        std::vector<NamedValues> output_inputs;
+        output_inputs.reserve(lqs.size());
+        for (size_t frame_index = 0; frame_index < lqs.size(); ++frame_index) {
+            output_inputs.push_back(
+                build_output_frame_inputs(
+                    lqs,
+                    spatial_feats,
+                    branch_feats,
+                    static_cast<int>(frame_index)));
+        }
+
+        trace.output_frame = runner(kOutputFrame).run_many_to_cpu(output_inputs);
+        return trace;
+    }
+
     std::vector<ncnn::Mat> restore_impl(const std::vector<ModuleValue>& lqs) const
     {
         if (lqs.size() < 2) {
@@ -821,31 +1367,36 @@ private:
             ncnn::VkCompute preprocess_cmd(runner(kQuarterDownsample).vkdev());
             std::vector<ncnn::Extractor> preprocess_extractors;
             preprocess_extractors.reserve(lqs.size() * 2 + (lqs.size() - 1) * 2);
+            std::vector<ncnn::VkMat> preprocess_bridged_inputs;
+            preprocess_bridged_inputs.reserve(lqs.size() * 4 + (lqs.size() - 1) * 4);
+            std::vector<ncnn::VkMat> preprocess_kept_tensors;
+            preprocess_kept_tensors.reserve(lqs.size() * 6 + (lqs.size() - 1) * 8);
 
             for (const ModuleValue& current_lq : lqs) {
                 lqs_downsampled.push_back(
                     runner(kQuarterDownsample).record_to_gpu(
                         {{"in0", current_lq}},
                         preprocess_cmd,
-                        preprocess_extractors));
+                        preprocess_extractors,
+                        preprocess_bridged_inputs));
                 spatial_feats.push_back(
                     runner(kFeatExtract).record_to_gpu(
                         {{"in0", current_lq}},
                         preprocess_cmd,
-                        preprocess_extractors));
+                        preprocess_extractors,
+                        preprocess_bridged_inputs));
             }
 
             for (size_t index = 0; index + 1 < lqs_downsampled.size(); ++index) {
-                flows_backward.push_back(
-                    runner(kSpyNet).record_to_gpu(
-                        {{"in0", lqs_downsampled[index]}, {"in1", lqs_downsampled[index + 1]}},
-                        preprocess_cmd,
-                        preprocess_extractors));
-                flows_forward.push_back(
-                    runner(kSpyNet).record_to_gpu(
-                        {{"in0", lqs_downsampled[index + 1]}, {"in1", lqs_downsampled[index]}},
-                        preprocess_cmd,
-                        preprocess_extractors));
+                const auto flow_pair = record_flow_pair(
+                    lqs_downsampled[index],
+                    lqs_downsampled[index + 1],
+                    preprocess_cmd,
+                    preprocess_extractors,
+                    preprocess_bridged_inputs,
+                    preprocess_kept_tensors);
+                flows_backward.push_back(flow_pair.first);
+                flows_forward.push_back(flow_pair.second);
             }
 
             if (preprocess_cmd.submit_and_wait() != 0) {
@@ -930,6 +1481,11 @@ private:
         ncnn::Option opt = runner(kQuarterDownsample).gpu_option();
         opt.use_vulkan_compute = true;
         opt.use_packing_layout = false;
+        opt.use_fp16_storage = false;
+        opt.use_fp16_packed = false;
+        opt.use_fp16_arithmetic = false;
+        opt.use_bf16_storage = false;
+        opt.use_bf16_packed = false;
 
         std::vector<std::uint32_t> spirv;
         const int compile_ret = ncnn::compile_spirv_module(
@@ -963,6 +1519,11 @@ private:
         ncnn::Option opt = runner(kQuarterDownsample).gpu_option();
         opt.use_vulkan_compute = true;
         opt.use_packing_layout = false;
+        opt.use_fp16_storage = false;
+        opt.use_fp16_packed = false;
+        opt.use_fp16_arithmetic = false;
+        opt.use_bf16_storage = false;
+        opt.use_bf16_packed = false;
 
         std::vector<std::uint32_t> spirv;
         const int compile_ret = ncnn::compile_spirv_module(
@@ -987,6 +1548,183 @@ private:
         }
     }
 
+    ncnn::Option make_tensor_resize_option() const
+    {
+        ncnn::Option opt = runner(kSpyNet).gpu_option();
+        opt.use_vulkan_compute = true;
+        opt.use_packing_layout = false;
+        opt.use_fp16_storage = false;
+        opt.use_fp16_packed = false;
+        opt.use_fp16_arithmetic = false;
+        opt.use_bf16_storage = false;
+        opt.use_bf16_packed = false;
+        return opt;
+    }
+
+    void ensure_tensor_resize_pipeline() const
+    {
+        if (tensor_resize_pipeline_ != nullptr) {
+            return;
+        }
+
+        const ncnn::Option opt = make_tensor_resize_option();
+        std::vector<std::uint32_t> spirv;
+        const int compile_ret = ncnn::compile_spirv_module(
+            kBasicVsrppTensorResizeShader,
+            static_cast<int>(sizeof(kBasicVsrppTensorResizeShader) - 1),
+            opt,
+            spirv);
+        if (compile_ret != 0) {
+            throw std::runtime_error("Failed to compile BasicVSR++ tensor resize shader.");
+        }
+
+        tensor_resize_pipeline_ = new ncnn::Pipeline(runner(kSpyNet).vkdev());
+        tensor_resize_pipeline_->set_optimal_local_size_xyz(8, 8, 1);
+        if (
+            tensor_resize_pipeline_->create(
+                spirv.data(),
+                spirv.size() * sizeof(std::uint32_t),
+                std::vector<ncnn::vk_specialization_type>()) != 0) {
+            delete tensor_resize_pipeline_;
+            tensor_resize_pipeline_ = nullptr;
+            throw std::runtime_error("Failed to create BasicVSR++ tensor resize pipeline.");
+        }
+    }
+
+    ncnn::VkMat resize_tensor_on_gpu(
+        const ncnn::VkMat& input,
+        int dst_height,
+        int dst_width,
+        float channel0_scale,
+        float channel1_scale,
+        ncnn::VkCompute& cmd,
+        std::vector<ncnn::VkMat>& kept_tensors) const
+    {
+        if (dst_height <= 0 || dst_width <= 0) {
+            throw std::runtime_error("BasicVSR++ tensor resize received an invalid destination shape.");
+        }
+
+        ensure_tensor_resize_pipeline();
+        const ncnn::Option opt = make_tensor_resize_option();
+
+        ncnn::VkMat unpacked_input;
+        runner(kSpyNet).vkdev()->convert_packing(input, unpacked_input, 1, 1, cmd, opt);
+        if (unpacked_input.empty()) {
+            throw std::runtime_error("Failed to prepare BasicVSR++ tensor resize input.");
+        }
+        kept_tensors.push_back(unpacked_input);
+        const ncnn::VkMat& shader_input = kept_tensors.back();
+
+        const int channels = shader_input.c * shader_input.elempack;
+        ncnn::VkMat output;
+        output.create(dst_width, dst_height, channels, static_cast<size_t>(4u), 1, opt.blob_vkallocator);
+        if (output.empty()) {
+            throw std::runtime_error("Failed to allocate BasicVSR++ tensor resize output.");
+        }
+
+        std::vector<ncnn::VkMat> bindings(2);
+        bindings[0] = shader_input;
+        bindings[1] = output;
+        std::vector<ncnn::vk_constant_type> constants(9);
+        constants[0].i = shader_input.w;
+        constants[1].i = shader_input.h;
+        constants[2].i = dst_width;
+        constants[3].i = dst_height;
+        constants[4].i = channels;
+        constants[5].i = static_cast<int>(shader_input.cstep);
+        constants[6].i = static_cast<int>(output.cstep);
+        constants[7].f = channel0_scale;
+        constants[8].f = channel1_scale;
+        cmd.record_pipeline(tensor_resize_pipeline_, bindings, constants, output);
+        kept_tensors.push_back(output);
+        return kept_tensors.back();
+    }
+
+    FlowRunSpec flow_run_spec_for_shape(int height, int width) const
+    {
+        if (
+            has_runner(kSpyNetPatch)
+            && spynet_patch_height_ > 0
+            && spynet_patch_width_ > 0
+            && height == spynet_patch_height_
+            && width == spynet_patch_width_) {
+            return {std::string(kSpyNetPatch), spynet_patch_height_, spynet_patch_width_};
+        }
+
+        const int runtime_height = spynet_core_height_ > 0 ? spynet_core_height_ : height;
+        const int runtime_width = spynet_core_width_ > 0 ? spynet_core_width_ : width;
+        return {std::string(kSpyNet), runtime_height, runtime_width};
+    }
+
+    std::pair<ncnn::VkMat, ncnn::VkMat> record_flow_pair(
+        const ncnn::VkMat& ref,
+        const ncnn::VkMat& supp,
+        ncnn::VkCompute& cmd,
+        std::vector<ncnn::Extractor>& extractors,
+        std::vector<ncnn::VkMat>& bridged_inputs,
+        std::vector<ncnn::VkMat>& kept_tensors) const
+    {
+        if (ref.w != supp.w || ref.h != supp.h) {
+            throw std::runtime_error("BasicVSR++ flow runner expects matched quarter-resolution shapes.");
+        }
+
+        const FlowRunSpec flow_spec = flow_run_spec_for_shape(ref.h, ref.w);
+        ncnn::VkMat ref_for_flow = ref;
+        ncnn::VkMat supp_for_flow = supp;
+        if (flow_spec.runtime_height != ref.h || flow_spec.runtime_width != ref.w) {
+            ref_for_flow = resize_tensor_on_gpu(
+                ref,
+                flow_spec.runtime_height,
+                flow_spec.runtime_width,
+                1.0f,
+                1.0f,
+                cmd,
+                kept_tensors);
+            supp_for_flow = resize_tensor_on_gpu(
+                supp,
+                flow_spec.runtime_height,
+                flow_spec.runtime_width,
+                1.0f,
+                1.0f,
+                cmd,
+                kept_tensors);
+        }
+
+        ncnn::VkMat backward_flow = runner(flow_spec.runner_name).record_to_gpu(
+            {{"in0", ref_for_flow}, {"in1", supp_for_flow}},
+            cmd,
+            extractors,
+            bridged_inputs);
+        ncnn::VkMat forward_flow = runner(flow_spec.runner_name).record_to_gpu(
+            {{"in0", supp_for_flow}, {"in1", ref_for_flow}},
+            cmd,
+            extractors,
+            bridged_inputs);
+
+        if (backward_flow.h != ref.h || backward_flow.w != ref.w) {
+            backward_flow = resize_tensor_on_gpu(
+                backward_flow,
+                ref.h,
+                ref.w,
+                static_cast<float>(ref.w) / static_cast<float>(backward_flow.w),
+                static_cast<float>(ref.h) / static_cast<float>(backward_flow.h),
+                cmd,
+                kept_tensors);
+        }
+        if (forward_flow.h != ref.h || forward_flow.w != ref.w) {
+            forward_flow = resize_tensor_on_gpu(
+                forward_flow,
+                ref.h,
+                ref.w,
+                static_cast<float>(ref.w) / static_cast<float>(forward_flow.w),
+                static_cast<float>(ref.h) / static_cast<float>(forward_flow.h),
+                cmd,
+                kept_tensors);
+        }
+
+        return {backward_flow, forward_flow};
+    }
+
     std::vector<ncnn::VkMat> preprocess_packed_bgr_frames(const std::vector<PackedBgrFrame>& frames) const
     {
         clip_trace("[clip] preprocess_bgr_u8 begin frames=%zu\n", frames.size());
@@ -1001,6 +1739,11 @@ private:
         ncnn::Option opt = runner(kQuarterDownsample).gpu_option();
         opt.use_vulkan_compute = true;
         opt.use_packing_layout = false;
+        opt.use_fp16_storage = false;
+        opt.use_fp16_packed = false;
+        opt.use_fp16_arithmetic = false;
+        opt.use_bf16_storage = false;
+        opt.use_bf16_packed = false;
 
         ncnn::VkCompute cmd(runner(kQuarterDownsample).vkdev());
         for (const PackedBgrFrame& frame : frames) {
@@ -1060,6 +1803,11 @@ private:
         ncnn::Option opt = runner(kQuarterDownsample).gpu_option();
         opt.use_vulkan_compute = true;
         opt.use_packing_layout = false;
+        opt.use_fp16_storage = false;
+        opt.use_fp16_packed = false;
+        opt.use_fp16_arithmetic = false;
+        opt.use_bf16_storage = false;
+        opt.use_bf16_packed = false;
 
         ncnn::VkCompute cmd(runner(kQuarterDownsample).vkdev());
         for (const PackedBgrResizeFrame& frame : frames) {
@@ -1119,6 +1867,11 @@ private:
         return *runners_.at(module_name);
     }
 
+    bool has_runner(const std::string& module_name) const
+    {
+        return runners_.find(module_name) != runners_.end();
+    }
+
     std::vector<ncnn::VkMat> run_branch(
         const std::string& module_name,
         const std::vector<ncnn::VkMat>& spatial_feats,
@@ -1144,6 +1897,8 @@ private:
         ncnn::VkCompute branch_cmd(runner(module_name + "_backbone").vkdev());
         std::vector<ncnn::Extractor> branch_extractors;
         branch_extractors.reserve(frame_indices.size());
+        std::vector<ncnn::VkMat> branch_bridged_inputs;
+        branch_bridged_inputs.reserve(frame_indices.size() * 10);
 
         for (size_t step_index = 0; step_index < frame_indices.size(); ++step_index) {
             const int frame_index = frame_indices[step_index];
@@ -1158,7 +1913,8 @@ private:
                         branch_feats,
                         frame_index),
                     branch_cmd,
-                    branch_extractors);
+                    branch_extractors,
+                    branch_bridged_inputs);
                 outputs.push_back(std::get<ncnn::VkMat>(feat_prop));
                 continue;
             }
@@ -1180,7 +1936,8 @@ private:
                     raw_flow_n1,
                     prev_flow_n2),
                 branch_cmd,
-                branch_extractors);
+                branch_extractors,
+                branch_bridged_inputs);
             outputs.push_back(std::get<ncnn::VkMat>(feat_prop));
             previous_raw_flow = raw_flow_n1;
         }
@@ -1203,6 +1960,12 @@ private:
     mutable std::unordered_map<std::string, double> last_profile_;
     mutable ncnn::Pipeline* frame_preprocess_pipeline_ = nullptr;
     mutable ncnn::Pipeline* frame_resize_preprocess_pipeline_ = nullptr;
+    mutable ncnn::Pipeline* tensor_resize_pipeline_ = nullptr;
+    bool fp16_ = false;
+    int spynet_patch_height_ = -1;
+    int spynet_patch_width_ = -1;
+    int spynet_core_height_ = -1;
+    int spynet_core_width_ = -1;
 };
 
 PackedBgrFrame pack_bgr_u8_frame(const py::handle& value)
@@ -1265,10 +2028,16 @@ PackedBgrResizeFrame pack_bgr_u8_resize_frame(
         throw std::runtime_error("BasicVsrppClipRunner resized input received invalid target metadata.");
     }
 
-    const float scale_width = static_cast<float>(target_size) / static_cast<float>(resize_reference_width);
-    const float scale_height = static_cast<float>(target_size) / static_cast<float>(resize_reference_height);
-    const int resized_w = std::max(1, static_cast<int>(std::floor(packed_frame.width * scale_width)));
-    const int resized_h = std::max(1, static_cast<int>(std::floor(packed_frame.height * scale_height)));
+    const int resized_w = std::max(
+        1,
+        static_cast<int>(
+            (static_cast<std::int64_t>(packed_frame.width) * static_cast<std::int64_t>(target_size))
+            / static_cast<std::int64_t>(resize_reference_width)));
+    const int resized_h = std::max(
+        1,
+        static_cast<int>(
+            (static_cast<std::int64_t>(packed_frame.height) * static_cast<std::int64_t>(target_size))
+            / static_cast<std::int64_t>(resize_reference_height)));
     if (resized_w > target_size || resized_h > target_size) {
         throw std::runtime_error("BasicVsrppClipRunner resized input exceeds the target frame size.");
     }
@@ -1299,15 +2068,24 @@ void bind_basicvsrpp_clip_runner(py::module_& m)
 #if NCNN_VULKAN
     py::class_<BasicVsrppClipRunner>(m, "BasicVsrppClipRunner")
         .def(
-            py::init([](const py::dict& module_paths, bool fp16, int num_threads) {
+            py::init([](
+                         const py::dict& module_paths,
+                         bool fp16,
+                         int num_threads,
+                         const std::vector<int>& spynet_patch_shape,
+                         const std::vector<int>& spynet_core_shape) {
                 return std::make_unique<BasicVsrppClipRunner>(
                     parse_module_artifacts_map(module_paths),
                     fp16,
-                    num_threads);
+                    num_threads,
+                    spynet_patch_shape,
+                    spynet_core_shape);
             }),
             py::arg("module_paths"),
             py::arg("fp16") = false,
-            py::arg("num_threads") = 1)
+            py::arg("num_threads") = 1,
+            py::arg("spynet_patch_shape") = std::vector<int>(),
+            py::arg("spynet_core_shape") = std::vector<int>())
         .def(
             "restore",
             [](const BasicVsrppClipRunner& self, const py::list& lqs) {
@@ -1390,6 +2168,89 @@ void bind_basicvsrpp_clip_runner(py::module_& m)
                 for (const ncnn::Mat& output : outputs) {
                     result.append(ncnn_mat_to_py_array(output));
                 }
+                return result;
+            },
+            py::arg("lqs"),
+            py::arg("target_size"),
+            py::arg("resize_reference_shape"),
+            py::arg("pad_mode"))
+        .def(
+            "debug_trace",
+            [](const BasicVsrppClipRunner& self, const py::list& lqs) {
+                std::vector<ncnn::Mat> input_mats;
+                input_mats.reserve(py::len(lqs));
+                for (const py::handle& item : lqs) {
+                    auto array = py::array_t<float, py::array::c_style | py::array::forcecast>::ensure(item);
+                    if (!array) {
+                        throw std::runtime_error(
+                            "BasicVsrppClipRunner inputs must be float32 numpy-compatible arrays.");
+                    }
+                    input_mats.push_back(py_array_to_ncnn_mat(array));
+                }
+
+                ClipDebugTrace trace;
+                {
+                    py::gil_scoped_release release;
+                    trace = self.debug_trace(input_mats);
+                }
+
+                py::dict result;
+                result[py::str("lqs")] = ncnn_mats_to_py_list(trace.lqs);
+                result[py::str("quarter_downsample")] = ncnn_mats_to_py_list(trace.quarter_downsample);
+                result[py::str("feat_extract")] = ncnn_mats_to_py_list(trace.feat_extract);
+                result[py::str("flows_backward")] = ncnn_mats_to_py_list(trace.flows_backward);
+                result[py::str("flows_forward")] = ncnn_mats_to_py_list(trace.flows_forward);
+                result[py::str("backward_1")] = ncnn_mats_to_py_list(trace.backward_1);
+                result[py::str("forward_1")] = ncnn_mats_to_py_list(trace.forward_1);
+                result[py::str("backward_2")] = ncnn_mats_to_py_list(trace.backward_2);
+                result[py::str("forward_2")] = ncnn_mats_to_py_list(trace.forward_2);
+                result[py::str("output_frame")] = ncnn_mats_to_py_list(trace.output_frame);
+                return result;
+            },
+            py::arg("lqs"))
+        .def(
+            "debug_trace_bgr_u8_resized",
+            [](
+                const BasicVsrppClipRunner& self,
+                const py::list& lqs,
+                int target_size,
+                const std::vector<int>& resize_reference_shape,
+                const std::string& pad_mode) {
+                if (resize_reference_shape.size() != 2) {
+                    throw std::runtime_error(
+                        "BasicVsrppClipRunner resize_reference_shape must be [max_width, max_height].");
+                }
+
+                const int parsed_pad_mode = parse_basicvsrpp_pad_mode(pad_mode);
+                std::vector<PackedBgrResizeFrame> packed_frames;
+                packed_frames.reserve(py::len(lqs));
+                for (const py::handle& item : lqs) {
+                    packed_frames.push_back(
+                        pack_bgr_u8_resize_frame(
+                            item,
+                            target_size,
+                            resize_reference_shape[0],
+                            resize_reference_shape[1],
+                            parsed_pad_mode));
+                }
+
+                ClipDebugTrace trace;
+                {
+                    py::gil_scoped_release release;
+                    trace = self.debug_trace_bgr_u8_resized(packed_frames);
+                }
+
+                py::dict result;
+                result[py::str("lqs")] = ncnn_mats_to_py_list(trace.lqs);
+                result[py::str("quarter_downsample")] = ncnn_mats_to_py_list(trace.quarter_downsample);
+                result[py::str("feat_extract")] = ncnn_mats_to_py_list(trace.feat_extract);
+                result[py::str("flows_backward")] = ncnn_mats_to_py_list(trace.flows_backward);
+                result[py::str("flows_forward")] = ncnn_mats_to_py_list(trace.flows_forward);
+                result[py::str("backward_1")] = ncnn_mats_to_py_list(trace.backward_1);
+                result[py::str("forward_1")] = ncnn_mats_to_py_list(trace.forward_1);
+                result[py::str("backward_2")] = ncnn_mats_to_py_list(trace.backward_2);
+                result[py::str("forward_2")] = ncnn_mats_to_py_list(trace.forward_2);
+                result[py::str("output_frame")] = ncnn_mats_to_py_list(trace.output_frame);
                 return result;
             },
             py::arg("lqs"),

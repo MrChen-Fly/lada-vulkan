@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -9,9 +10,44 @@ from lada.compute_targets import (
     get_compute_target,
     normalize_compute_target_id,
 )
-from lada.models.yolo.ncnn_vulkan import NcnnVulkanYoloSegmentationModel
+from lada.extensions.runtime_registry import get_runtime_extension
 from lada.utils import Image, ImageTensor
 from lada.utils.ultralytics_utils import DetectionResult
+
+
+class _TorchDetectionModelAdapter:
+    runtime = "torch"
+
+    def __init__(self, model: object):
+        self._model = model
+        device = getattr(model, "device", "cpu")
+        self.torch_device = torch.device(device)
+        self.dtype = getattr(
+            model,
+            "dtype",
+            torch.float16 if bool(getattr(getattr(model, "args", None), "half", False)) else torch.float32,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
+
+    def prepare_input(self, imgs: torch.Tensor) -> torch.Tensor:
+        return imgs.to(device=self.torch_device).to(dtype=self.dtype).div_(255.0)
+
+    def consume_profile(self) -> dict[str, float | int]:
+        return {}
+
+    def release_cached_memory(self) -> None:
+        if self.torch_device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif self.torch_device.type == "mps" and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        elif (
+            self.torch_device.type == "xpu"
+            and hasattr(torch, "xpu")
+            and hasattr(torch.xpu, "empty_cache")
+        ):
+            torch.xpu.empty_cache()
 
 
 @runtime_checkable
@@ -20,14 +56,17 @@ class MosaicDetectionModel(Protocol):
     torch_device: torch.device | None
     dtype: torch.dtype | None
 
-    def preprocess(self, imgs: list[Image | ImageTensor]) -> torch.Tensor:
+    def preprocess(self, imgs: list[Image | ImageTensor]) -> torch.Tensor | list[Any]:
         ...
 
     def inference_and_postprocess(
         self,
-        imgs: torch.Tensor,
+        imgs: torch.Tensor | list[Any],
         orig_imgs: list[Image | ImageTensor],
     ) -> list[DetectionResult]:
+        ...
+
+    def consume_profile(self) -> dict[str, float | int]:
         ...
 
     def release_cached_memory(self) -> None:
@@ -61,9 +100,20 @@ def build_mosaic_detection_model(
             fp16=fp16,
             **kwargs,
         )
-    if target.runtime == "vulkan":
-        return NcnnVulkanYoloSegmentationModel(
+        return _TorchDetectionModelAdapter(
+            Yolo11SegmentationModel(
+                model_path=model_path,
+                device=target.torch_device,
+                imgsz=imgsz,
+                fp16=fp16,
+                **kwargs,
+            )
+        )
+    extension = get_runtime_extension(target.runtime)
+    if extension is not None and extension.build_detection_model is not None:
+        return extension.build_detection_model(
             model_path=model_path,
+            compute_target_id=normalized_target_id,
             imgsz=imgsz,
             fp16=fp16,
             **kwargs,

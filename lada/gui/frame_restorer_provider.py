@@ -16,8 +16,6 @@ from lada.utils import video_utils
 import gc
 import torch
 
-from lada.compute_targets import get_compute_target, resolve_torch_device
-
 @dataclass
 class FrameRestorerOptions:
     mosaic_restoration_model_name: str
@@ -127,22 +125,10 @@ class FrameRestorerProvider:
 
             mosaic_restoration_model_path = ModelFiles.get_restoration_model_by_name(self.options.mosaic_restoration_model_name).path
             mosaic_detection_path = ModelFiles.get_detection_model_by_name(self.options.mosaic_detection_model_name).path
-            compute_target = get_compute_target(self.options.device, include_experimental=True)
-            if compute_target is None:
-                raise ValueError(f"Unknown compute target '{self.options.device}'")
-            torch_device = (
-                resolve_torch_device(self.options.device)
-                if compute_target.torch_device is not None
-                else None
-            )
-            loaded_models = load_models(
-                self.options.device, torch_device, self.options.mosaic_restoration_model_name, mosaic_restoration_model_path, None,
+            mosaic_detection_model, mosaic_restoration_model, mosaic_restoration_model_preferred_pad_mode = load_models(
+                torch.device(self.options.device), self.options.mosaic_restoration_model_name, mosaic_restoration_model_path, None,
                 mosaic_detection_path, fp16=self.options.fp16_enabled, detect_face_mosaics=self.options.detect_face_mosaics,
             )
-            mosaic_detection_model = loaded_models.detection_model
-            mosaic_restoration_model = loaded_models.restoration_model
-            mosaic_restoration_model_preferred_pad_mode = loaded_models.preferred_pad_mode
-            frame_device = torch_device if torch_device is not None else torch.device("cpu")
 
             self.models_cache = dict(mosaic_restoration_model_name=self.options.mosaic_restoration_model_name,
                                      mosaic_detection_model_name=self.options.mosaic_detection_model_name,
@@ -150,10 +136,9 @@ class FrameRestorerProvider:
                                      mosaic_detection_model=mosaic_detection_model,
                                      mosaic_restoration_model=mosaic_restoration_model,
                                      mosaic_restoration_model_preferred_pad_mode=mosaic_restoration_model_preferred_pad_mode,
-                                     frame_device=frame_device,
                                      detect_face_mosaics=self.options.detect_face_mosaics)
 
-        return FrameRestorer(self.models_cache["frame_device"],
+        return FrameRestorer(self.options.device,
                              self.options.video_metadata.video_file,
                              self.options.max_clip_length,
                              self.options.mosaic_restoration_model_name,
@@ -165,12 +150,8 @@ class FrameRestorerProvider:
     def _clear_cache(self):
         if self.models_cache is None:
             return
-        if "mosaic_detection_model" in self.models_cache:
-            del self.models_cache["mosaic_detection_model"]
-        if "mosaic_restoration_model" in self.models_cache:
-            if hasattr(self.models_cache["mosaic_restoration_model"], "release_cached_memory"):
-                self.models_cache["mosaic_restoration_model"].release_cached_memory()
-            del self.models_cache["mosaic_restoration_model"]
+        if "mosaic_detection_model" in self.models_cache: del self.models_cache["mosaic_detection_model"]
+        if "mosaic_restoration_model" in self.models_cache: del self.models_cache["mosaic_restoration_model"]
         gc.collect()
         try:
             if torch.cuda.is_available():

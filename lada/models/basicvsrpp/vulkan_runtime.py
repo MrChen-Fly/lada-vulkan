@@ -66,6 +66,27 @@ class BasicVsrppSpynetFlowModule(nn.Module):
         return self.spynet(ref, supp)
 
 
+class BasicVsrppSpynetComputeFlowModule(nn.Module):
+    """Export only the SPyNet pyramid core without the outer resize wrapper."""
+
+    def __init__(self, spynet: SPyNet, *, clone_module: bool = True):
+        super().__init__()
+        self.spynet = deepcopy(spynet) if clone_module else spynet
+
+    @classmethod
+    def from_model(
+        cls,
+        model: nn.Module,
+        *,
+        clone_module: bool = True,
+    ) -> "BasicVsrppSpynetComputeFlowModule":
+        generator = get_basicvsrpp_generator(model)
+        return cls(generator.spynet, clone_module=clone_module)
+
+    def forward(self, ref: torch.Tensor, supp: torch.Tensor) -> torch.Tensor:
+        return self.spynet.compute_flow(ref, supp)
+
+
 class BasicVsrppFlowWarpModule(nn.Module):
     """Standalone wrapper around ``flow_warp`` for runtime assembly."""
 

@@ -22,6 +22,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:RestoreSoaPicWebmPipelineRevision = "2026-04-08-vulkan-output-r3"
 
 function Get-DefaultProjectRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -29,6 +30,83 @@ function Get-DefaultProjectRoot {
 
 function Get-DefaultStatePath {
     return (Join-Path $PSScriptRoot "restore_soa_pic_webm_state.json")
+}
+
+function Get-OutputRevisionMarkerPath {
+    param([Parameter(Mandatory)] [string]$OutputRoot)
+
+    return (Join-Path $OutputRoot ".lada_restore_revision.json")
+}
+
+function Read-JsonFile {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    try {
+        return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-StoredPipelineRevision {
+    param([Parameter(Mandatory)] [string]$MarkerPath)
+
+    $payload = Read-JsonFile -Path $MarkerPath
+    if ($null -eq $payload) {
+        return $null
+    }
+
+    $pipelineRevision = $payload.pipelineRevision
+    if ([string]::IsNullOrWhiteSpace($pipelineRevision)) {
+        return $null
+    }
+    return [string]$pipelineRevision
+}
+
+function Get-StoredPipelineStatus {
+    param([Parameter(Mandatory)] [string]$MarkerPath)
+
+    $payload = Read-JsonFile -Path $MarkerPath
+    if ($null -eq $payload) {
+        return $null
+    }
+
+    $status = $payload.status
+    if ([string]::IsNullOrWhiteSpace($status)) {
+        return $null
+    }
+    return [string]$status
+}
+
+function Write-PipelineRevisionMarker {
+    param(
+        [Parameter(Mandatory)] [string]$MarkerPath,
+        [Parameter(Mandatory)] [string]$PipelineRevision,
+        [Parameter(Mandatory)] [string]$Device,
+        [string[]]$CliArgs = @(),
+        [string]$Status = "ready"
+    )
+
+    $markerDirectory = Split-Path -Parent $MarkerPath
+    if (-not [string]::IsNullOrWhiteSpace($markerDirectory)) {
+        New-Item -ItemType Directory -Force -Path $markerDirectory | Out-Null
+    }
+
+    $payload = @{
+        pipelineRevision = $PipelineRevision
+        status = $Status
+        updatedAt = [System.DateTimeOffset]::Now.ToString("o")
+        device = $Device
+        cliArgs = $CliArgs
+    }
+    $json = $payload | ConvertTo-Json -Depth 5
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($MarkerPath, $json, $utf8NoBom)
 }
 
 function Get-FullPath {
@@ -135,6 +213,82 @@ function Test-OutputFileReady {
     }
 
     return $true
+}
+
+function Get-FfprobeCommandPath {
+    $resolvedVariable = Get-Variable -Name "RestoreSoaPicWebmFfprobeResolved" -Scope Script -ErrorAction SilentlyContinue
+    if (($null -ne $resolvedVariable) -and [bool]$resolvedVariable.Value) {
+        $pathVariable = Get-Variable -Name "RestoreSoaPicWebmFfprobePath" -Scope Script -ErrorAction SilentlyContinue
+        if ($null -ne $pathVariable) {
+            return $pathVariable.Value
+        }
+        return $null
+    }
+
+    $script:RestoreSoaPicWebmFfprobeResolved = $true
+    $ffprobe = Get-Command "ffprobe" -ErrorAction SilentlyContinue
+    if ($null -ne $ffprobe) {
+        $script:RestoreSoaPicWebmFfprobePath = $ffprobe.Source
+    }
+    else {
+        $script:RestoreSoaPicWebmFfprobePath = $null
+    }
+    return $script:RestoreSoaPicWebmFfprobePath
+}
+
+function Get-EmbeddedPipelineRevision {
+    param([Parameter(Mandatory)] [string]$OutputPath)
+
+    if (-not (Test-Path -LiteralPath $OutputPath)) {
+        return $null
+    }
+
+    $ffprobePath = Get-FfprobeCommandPath
+    if ([string]::IsNullOrWhiteSpace($ffprobePath)) {
+        return $null
+    }
+
+    $ffprobeArguments = @(
+        "-v", "error",
+        "-show_entries", "format_tags",
+        "-of", "default=noprint_wrappers=1:nokey=0",
+        $OutputPath
+    )
+
+    try {
+        $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processStartInfo.FileName = $ffprobePath
+        $processStartInfo.Arguments = ConvertTo-ProcessArguments -Arguments $ffprobeArguments
+        $processStartInfo.UseShellExecute = $false
+        $processStartInfo.RedirectStandardOutput = $true
+        $processStartInfo.RedirectStandardError = $true
+        $processStartInfo.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processStartInfo
+        $null = $process.Start()
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        $process.Dispose()
+
+        if ($exitCode -ne 0 -or [string]::IsNullOrWhiteSpace($stdout)) {
+            return $null
+        }
+
+        $revisionMatch = [System.Text.RegularExpressions.Regex]::Match(
+            $stdout,
+            "pipeline_revision=([^;`r`n]+)"
+        )
+        if (-not $revisionMatch.Success) {
+            return $null
+        }
+        return $revisionMatch.Groups[1].Value.Trim()
+    }
+    catch {
+        return $null
+    }
 }
 
 function Get-DefaultWebmEncodingArgs {
@@ -364,7 +518,10 @@ function Invoke-LadaCliBatch {
 
         $processArguments = ConvertTo-ProcessArguments -Arguments @($commandArgs + $Arguments)
         if (-not $hadSvtLog) {
-            $env:SVT_LOG = "0"
+            # SVT_LOG=1 keeps the encoder banner quiet in this batch harness.
+            # We reproduced black-block corruption on staged WebM exports with
+            # SVT_LOG=0, so never force that value here.
+            $env:SVT_LOG = "1"
         }
 
         $cancelMonitor = Start-ConsoleCancelMonitor
@@ -377,6 +534,7 @@ function Invoke-LadaCliBatch {
         $processStartInfo.RedirectStandardOutput = $false
         $processStartInfo.RedirectStandardError = $false
         $processStartInfo.CreateNoWindow = $false
+        $processStartInfo.EnvironmentVariables["LADA_OUTPUT_PIPELINE_REVISION"] = $script:RestoreSoaPicWebmPipelineRevision
 
         $ladaProcess = New-Object System.Diagnostics.Process
         $ladaProcess.StartInfo = $processStartInfo
@@ -452,6 +610,7 @@ $resolvedOutputRoot = if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 else {
     Get-FullPath $OutputRoot
 }
+$resolvedOutputRevisionMarkerPath = Get-OutputRevisionMarkerPath -OutputRoot $resolvedOutputRoot
 
 $resolvedStatePath = if ([string]::IsNullOrWhiteSpace($StatePath)) {
     Get-DefaultStatePath
@@ -459,6 +618,34 @@ $resolvedStatePath = if ([string]::IsNullOrWhiteSpace($StatePath)) {
 else {
     Get-FullPath $StatePath
 }
+$explicitForceReconvert = $ForceReconvert.IsPresent
+$hasExistingOutputFiles = (
+    (Test-Path -LiteralPath $resolvedOutputRoot) -and
+    ($null -ne (Get-ChildItem -LiteralPath $resolvedOutputRoot -Recurse -File -Filter "*.webm" -ErrorAction SilentlyContinue | Select-Object -First 1))
+)
+$storedPipelineRevision = Get-StoredPipelineRevision -MarkerPath $resolvedOutputRevisionMarkerPath
+$storedPipelineStatus = Get-StoredPipelineStatus -MarkerPath $resolvedOutputRevisionMarkerPath
+if ((-not $ResetState) -and (-not $explicitForceReconvert) -and $hasExistingOutputFiles) {
+    if ([string]::IsNullOrWhiteSpace($storedPipelineRevision)) {
+        Write-Warning (
+            "The output-root pipeline marker does not record a revision. " +
+            "Existing outputs will be checked one by one via their embedded media metadata."
+        )
+    }
+    elseif (-not [string]::Equals($storedPipelineStatus, "ready", [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Warning (
+            "Existing outputs are tracked by a pipeline revision marker left in status '$storedPipelineStatus'. " +
+            "Resuming by checking each output file's embedded pipeline revision instead of clearing the whole dist directory."
+        )
+    }
+    elseif ($storedPipelineRevision -ne $script:RestoreSoaPicWebmPipelineRevision) {
+        Write-Warning (
+            "Existing outputs were produced with pipeline revision '$storedPipelineRevision'. " +
+            "Current revision is '$($script:RestoreSoaPicWebmPipelineRevision)'. Existing outputs will be checked individually and only mismatched files will be regenerated."
+        )
+    }
+}
+$skipExistingOutputsForThisRun = $ForceReconvert.IsPresent
 
 if ($RetryCount -lt 0) {
     throw "RetryCount must be >= 0"
@@ -496,14 +683,24 @@ if ($sourceFiles.Count -eq 0) {
 $readyOutputCount = 0
 $readyBackupCount = 0
 $staleOutputPaths = New-Object System.Collections.Generic.List[string]
+$staleOutputMetadataCount = 0
 foreach ($file in $sourceFiles) {
     $relativePath = Get-RelativePath -BasePath $SourceRoot -TargetPath $file.FullName
     $finalOutputPath = Join-Path $resolvedOutputRoot $relativePath
     $backupPath = Join-Path $resolvedBackupRoot $relativePath
 
-    if ((-not $ForceReconvert) -and (Test-Path -LiteralPath $finalOutputPath)) {
+    if ((-not $skipExistingOutputsForThisRun) -and (Test-Path -LiteralPath $finalOutputPath)) {
         if (Test-OutputFileReady -OutputPath $finalOutputPath) {
-            $readyOutputCount++
+            $embeddedPipelineRevision = Get-EmbeddedPipelineRevision -OutputPath $finalOutputPath
+            if ($embeddedPipelineRevision -eq $script:RestoreSoaPicWebmPipelineRevision) {
+                $readyOutputCount++
+            }
+            else {
+                if ([string]::IsNullOrWhiteSpace($embeddedPipelineRevision)) {
+                    $staleOutputMetadataCount++
+                }
+                $staleOutputPaths.Add($finalOutputPath)
+            }
         }
         else {
             $staleOutputPaths.Add($finalOutputPath)
@@ -516,7 +713,13 @@ foreach ($file in $sourceFiles) {
 
 $staleOutputPaths = @($staleOutputPaths | Sort-Object -Unique)
 if ($staleOutputPaths.Count -gt 0) {
-    Write-Warning "Found $($staleOutputPaths.Count) stale output file(s) with mismatched container signatures. They will be regenerated."
+    $staleReason = if ($staleOutputMetadataCount -gt 0) {
+        "$staleOutputMetadataCount file(s) are missing or mismatching the embedded pipeline revision metadata"
+    }
+    else {
+        "their embedded pipeline revision does not match '$($script:RestoreSoaPicWebmPipelineRevision)' or their container signature is invalid"
+    }
+    Write-Warning "Found $($staleOutputPaths.Count) stale output file(s); $staleReason. They will be regenerated."
     if (-not $DryRun) {
         foreach ($staleOutputPath in $staleOutputPaths) {
             if (-not (Test-IsPathInside -ParentPath $resolvedOutputRoot -ChildPath $staleOutputPath)) {
@@ -527,7 +730,7 @@ if ($staleOutputPaths.Count -gt 0) {
     }
 }
 
-$pendingOutputCount = if ($ForceReconvert) { $sourceFiles.Count } else { $sourceFiles.Count - $readyOutputCount }
+$pendingOutputCount = if ($skipExistingOutputsForThisRun) { $sourceFiles.Count } else { $sourceFiles.Count - $readyOutputCount }
 $pendingBackupCount = if ($ForceBackup) { $sourceFiles.Count } else { $sourceFiles.Count - $readyBackupCount }
 
 $cliArgs = @(
@@ -583,6 +786,7 @@ Write-Host "Project root: $resolvedProjectRoot"
 Write-Host "Backup root : $resolvedBackupRoot"
 Write-Host "Output root : $resolvedOutputRoot"
 Write-Host "State file  : $resolvedStatePath"
+Write-Host "Revision    : $($script:RestoreSoaPicWebmPipelineRevision)"
 Write-Host "Device      : $Device"
 Write-Host "Max files   : $(if ($MaxFiles -gt 0) { $MaxFiles } else { 'all' })"
 Write-Host "Files found : $($sourceFiles.Count)"
@@ -597,12 +801,27 @@ if ($DryRun) {
 Write-Host ""
 
 if ((-not $DryRun) -and $pendingOutputCount -le 0 -and $pendingBackupCount -le 0) {
+    Write-PipelineRevisionMarker `
+        -MarkerPath $resolvedOutputRevisionMarkerPath `
+        -PipelineRevision $script:RestoreSoaPicWebmPipelineRevision `
+        -Device $Device `
+        -CliArgs $cliArgs `
+        -Status "ready"
     Write-Host "Nothing pending. Backups and outputs are already complete."
     exit 0
 }
 
 Write-Host "Running internal lada-cli batch mode..."
 Write-Host ""
+
+if (-not $DryRun) {
+    Write-PipelineRevisionMarker `
+        -MarkerPath $resolvedOutputRevisionMarkerPath `
+        -PipelineRevision $script:RestoreSoaPicWebmPipelineRevision `
+        -Device $Device `
+        -CliArgs $cliArgs `
+        -Status "refreshing"
+}
 
 $ladaBatchExitCode = Invoke-LadaCliBatch -Command $resolvedLadaCommand -Arguments $cliArgs -WorkingDirectory $resolvedProjectRoot
 $global:LASTEXITCODE = $ladaBatchExitCode
@@ -614,4 +833,13 @@ if ($ladaBatchExitCode -eq 130) {
 
 if ($ladaBatchExitCode -ne 0) {
     throw "lada-cli exited with code $ladaBatchExitCode"
+}
+
+if (-not $DryRun) {
+    Write-PipelineRevisionMarker `
+        -MarkerPath $resolvedOutputRevisionMarkerPath `
+        -PipelineRevision $script:RestoreSoaPicWebmPipelineRevision `
+        -Device $Device `
+        -CliArgs $cliArgs `
+        -Status "ready"
 }

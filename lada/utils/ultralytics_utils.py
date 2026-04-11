@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 import os.path
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
 
@@ -15,54 +14,9 @@ from ultralytics.engine.results import Masks as UltralyticsMasks
 from ultralytics.engine.results import Results as UltralyticsResults
 from ultralytics.utils import JSONDict
 
-from lada.utils import Box, Image, Mask, MaskTensor
+from lada.utils import Box, Mask
 
-
-@dataclass(slots=True)
-class NativeYoloBox:
-    box: Box
-    conf_value: float
-    cls_value: float
-    id: torch.Tensor | None = None
-
-    @property
-    def xyxy(self) -> torch.Tensor:
-        t, l, b, r = self.box
-        return torch.tensor([[float(l), float(t), float(r), float(b)]], dtype=torch.float32)
-
-    @property
-    def conf(self) -> torch.Tensor:
-        return torch.tensor([self.conf_value], dtype=torch.float32)
-
-    @property
-    def cls(self) -> torch.Tensor:
-        return torch.tensor([self.cls_value], dtype=torch.float32)
-
-    @property
-    def xywh(self) -> torch.Tensor:
-        t, l, b, r = self.box
-        width = float(r - l)
-        height = float(b - t)
-        center_x = float(l) + width * 0.5
-        center_y = float(t) + height * 0.5
-        return torch.tensor([[center_x, center_y, width, height]], dtype=torch.float32)
-
-
-@dataclass(slots=True)
-class NativeYoloMask:
-    data: Mask | MaskTensor
-
-
-@dataclass(slots=True)
-class NativeYoloResult:
-    orig_img: Image | torch.Tensor
-    orig_shape: tuple[int, int]
-    names: dict[int, str]
-    boxes: list[NativeYoloBox]
-    masks: list[NativeYoloMask]
-
-
-DetectionResult: TypeAlias = UltralyticsResults | NativeYoloResult
+DetectionResult: TypeAlias = UltralyticsResults
 
 def set_default_settings():
     settings.update(dict(
@@ -78,59 +32,37 @@ def get_settings() -> JSONDict:
 
 def build_native_yolo_result(
     *,
-    orig_img: Image | torch.Tensor,
+    orig_img,
     names: dict[int, str],
     boxes: np.ndarray,
     masks: np.ndarray,
-) -> NativeYoloResult:
-    native_boxes: list[NativeYoloBox] = []
-    native_masks: list[NativeYoloMask] = []
-    img_h, img_w = tuple(int(v) for v in orig_img.shape[:2])
-
-    for row, mask in zip(boxes, masks):
-        l = int(np.clip(row[0], 0, img_w))
-        t = int(np.clip(row[1], 0, img_h))
-        r = int(np.clip(row[2], 0, img_w))
-        b = int(np.clip(row[3], 0, img_h))
-        native_boxes.append(
-            NativeYoloBox(
-                box=(t, l, b, r),
-                conf_value=float(row[4]),
-                cls_value=float(row[5]),
-            )
-        )
-
-        native_masks.append(NativeYoloMask(data=_ensure_mask_image(mask)))
-
-    return NativeYoloResult(
-        orig_img=orig_img,
-        orig_shape=tuple(orig_img.shape[:2]),
+) -> UltralyticsResults:
+    box_tensor = torch.from_numpy(
+        np.ascontiguousarray(boxes, dtype=np.float32).reshape(-1, 6)
+    )
+    mask_tensor = None
+    mask_array = np.ascontiguousarray(masks, dtype=np.uint8)
+    if mask_array.size > 0:
+        if mask_array.ndim == 2:
+            mask_array = mask_array[None, ...]
+        mask_tensor = torch.from_numpy(mask_array)
+    return UltralyticsResults(
+        orig_img,
+        path="",
         names=names,
-        boxes=native_boxes,
-        masks=native_masks,
+        boxes=box_tensor,
+        masks=mask_tensor,
     )
 
-
-def _extract_box_xyxy(yolo_box: UltralyticsBoxes | NativeYoloBox) -> torch.Tensor:
-    if isinstance(yolo_box, NativeYoloBox):
-        return yolo_box.xyxy[0]
-    return yolo_box.xyxy[0]
-
-
-def convert_yolo_box(yolo_box: UltralyticsBoxes | NativeYoloBox, img_shape) -> Box:
-    if isinstance(yolo_box, NativeYoloBox):
-        return yolo_box.box
-    _box = _extract_box_xyxy(yolo_box)
+def convert_yolo_box(yolo_box: UltralyticsBoxes, img_shape) -> Box:
+    _box = yolo_box.xyxy[0]
     l = int(torch.clip(_box[0], 0, img_shape[1]).item())
     t = int(torch.clip(_box[1], 0, img_shape[0]).item())
     r = int(torch.clip(_box[2], 0, img_shape[1]).item())
     b = int(torch.clip(_box[3], 0, img_shape[0]).item())
     return t, l, b, r
 
-
-def convert_yolo_boxes(yolo_box: UltralyticsBoxes | NativeYoloBox, img_shape) -> list[Box]:
-    if isinstance(yolo_box, NativeYoloBox):
-        return [yolo_box.box]
+def convert_yolo_boxes(yolo_box: UltralyticsBoxes, img_shape) -> list[Box]:
     _boxes = yolo_box.xyxy
     boxes = []
     for _box in _boxes:
@@ -142,9 +74,7 @@ def convert_yolo_boxes(yolo_box: UltralyticsBoxes | NativeYoloBox, img_shape) ->
         boxes.append(box)
     return boxes
 
-def convert_yolo_conf(yolo_box: UltralyticsBoxes | NativeYoloBox) -> float:
-    if isinstance(yolo_box, NativeYoloBox):
-        return yolo_box.conf_value
+def convert_yolo_conf(yolo_box: UltralyticsBoxes) -> float:
     return yolo_box.conf[0].item()
 
 def scale_and_unpad_image(masks, im0_shape):
@@ -160,40 +90,8 @@ def scale_and_unpad_image(masks, im0_shape):
     y = F.interpolate(x, size=(h0, w0), mode='bilinear', align_corners=False)
     return y.squeeze(0).permute(1, 2, 0).round_().clamp_(0, 255).to(masks.dtype)
 
-
-def _ensure_mask_image(mask: np.ndarray) -> Mask:
-    mask_array = mask if mask.flags.c_contiguous and mask.dtype == np.uint8 else np.ascontiguousarray(mask, dtype=np.uint8)
-    if mask_array.ndim == 2:
-        return mask_array[..., None]
-    if mask_array.ndim == 3 and mask_array.shape[0] == 1:
-        return np.ascontiguousarray(mask_array[0][..., None])
-    if mask_array.ndim == 3 and mask_array.shape[-1] == 1:
-        return mask_array
-    raise RuntimeError(f"Unsupported native mask shape {tuple(mask_array.shape)}.")
-
-def convert_yolo_mask_tensor(yolo_mask: UltralyticsMasks | NativeYoloMask, img_shape) -> torch.Tensor:
-    mask_data = yolo_mask.data
-    if (
-        isinstance(yolo_mask, NativeYoloMask)
-        and isinstance(mask_data, np.ndarray)
-        and mask_data.dtype == np.uint8
-        and tuple(mask_data.shape[:2]) == tuple(img_shape[:2])
-    ):
-        return torch.from_numpy(_ensure_mask_image(mask_data))
-
-    if (
-        isinstance(yolo_mask, NativeYoloMask)
-        and mask_data.dtype == torch.uint8
-        and tuple(mask_data.shape[-2:]) == tuple(img_shape[:2])
-    ):
-        if mask_data.ndim == 2:
-            return mask_data.unsqueeze(-1)
-        if mask_data.ndim == 3 and mask_data.shape[0] == 1:
-            return mask_data[0].unsqueeze(-1)
-        if mask_data.ndim == 3 and mask_data.shape[-1] == 1:
-            return mask_data
-
-    mask_img = _to_mask_img_tensor(mask_data)
+def convert_yolo_mask_tensor(yolo_mask: UltralyticsMasks, img_shape) -> torch.Tensor:
+    mask_img = _to_mask_img_tensor(yolo_mask.data)
     if mask_img.ndim == 2:
         mask_img = mask_img.unsqueeze(-1)
     mask_img = scale_and_unpad_image(mask_img, img_shape)
@@ -201,34 +99,23 @@ def convert_yolo_mask_tensor(yolo_mask: UltralyticsMasks | NativeYoloMask, img_s
     assert mask_img.ndim == 3 and mask_img.shape[2] == 1
     return mask_img
 
-
-def convert_yolo_mask_image(yolo_mask: UltralyticsMasks | NativeYoloMask, img_shape) -> Mask:
-    mask_data = yolo_mask.data
-    if isinstance(yolo_mask, NativeYoloMask) and isinstance(mask_data, np.ndarray):
-        return _ensure_mask_image(mask_data)
-
-    mask_img = convert_yolo_mask_tensor(yolo_mask, img_shape).cpu().numpy()
-    assert mask_img.ndim == 3 and mask_img.shape[2] == 1 and mask_img.dtype == np.uint8
-    return np.ascontiguousarray(mask_img)
-
 def _to_mask_img_tensor(masks: torch.Tensor, class_val=0, pixel_val=255) -> torch.Tensor:
     masks_tensor = torch.where(masks != class_val, pixel_val, 0).to(torch.uint8)
     return masks_tensor[0]
 
 def convert_yolo_mask(yolo_mask: UltralyticsMasks, img_shape) -> Mask:
-    return convert_yolo_mask_image(yolo_mask, img_shape)
+    mask_img = convert_yolo_mask_tensor(yolo_mask, img_shape).cpu().numpy()
+    assert mask_img.ndim == 3 and mask_img.shape[2] == 1 and mask_img.dtype == np.uint8
+    return mask_img
 
-def choose_biggest_detection(
-    result: DetectionResult,
-    tracking_mode=True,
-) -> tuple[UltralyticsBoxes | NativeYoloBox | None, UltralyticsMasks | NativeYoloMask | None]:
+def choose_biggest_detection(result: UltralyticsResults, tracking_mode=True) -> tuple[UltralyticsBoxes | None, UltralyticsMasks | None]:
     """
     Returns the biggest detection box and mask of a YOLO Results set
     """
     box = None
     mask = None
-    yolo_box: UltralyticsBoxes | NativeYoloBox
-    yolo_mask: UltralyticsMasks | NativeYoloMask
+    yolo_box: UltralyticsBoxes
+    yolo_mask: UltralyticsMasks
     for i, yolo_box in enumerate(result.boxes):
         if tracking_mode and yolo_box.id is None:
             continue

@@ -98,6 +98,30 @@ struct LadaVulkanTensor
         return download_vulkan_tensor_to_cpu_mat(*this);
     }
 
+    LadaVulkanTensor clone() const
+    {
+        if (!context) {
+            throw std::runtime_error("LadaVulkanTensor is detached from its Vulkan context.");
+        }
+
+        ncnn::Option opt = context->net->opt;
+        opt.use_vulkan_compute = true;
+        opt.use_packing_layout = false;
+        opt.blob_vkallocator = context->blob_vkallocator;
+        opt.workspace_vkallocator = context->blob_vkallocator;
+        opt.staging_vkallocator = context->staging_vkallocator;
+
+        ncnn::VkCompute cmd(context->vkdev);
+        ncnn::VkMat cloned_blob;
+        cmd.record_clone(blob, cloned_blob, opt);
+        const int ret = cmd.submit_and_wait();
+        if (ret != 0 || cloned_blob.empty()) {
+            throw std::runtime_error("Failed to clone Vulkan tensor.");
+        }
+
+        return LadaVulkanTensor(std::move(cloned_blob), context);
+    }
+
     bool empty() const
     {
         return blob.empty();
@@ -152,6 +176,91 @@ py::dict pack_yolo_seg_postprocess_result(const lada::YoloSegPostprocessResult& 
 
 py::object ncnn_mat_to_numpy(const ncnn::Mat& mat);
 
+ncnn::VkMat clone_vulkan_blob_to_context(
+    const ncnn::VkMat& blob,
+    const std::shared_ptr<LadaVulkanContext>& context)
+{
+    if (!context) {
+        throw std::runtime_error("Vulkan context is required to clone a tensor.");
+    }
+    if (blob.empty()) {
+        throw std::runtime_error("Cannot clone an empty Vulkan tensor.");
+    }
+
+    ncnn::Option opt = context->net->opt;
+    opt.use_vulkan_compute = true;
+    opt.use_packing_layout = false;
+    opt.blob_vkallocator = context->blob_vkallocator;
+    opt.workspace_vkallocator = context->blob_vkallocator;
+    opt.staging_vkallocator = context->staging_vkallocator;
+
+    ncnn::VkCompute cmd(context->vkdev);
+    ncnn::VkMat cloned_blob;
+    cmd.record_clone(blob, cloned_blob, opt);
+    if (cmd.submit_and_wait() != 0 || cloned_blob.empty()) {
+        throw std::runtime_error("Failed to clone Vulkan tensor into the target context.");
+    }
+
+    return cloned_blob;
+}
+
+std::vector<unsigned char> normalize_yolo_allowed_classes(
+    int num_classes,
+    const std::vector<int>& classes)
+{
+    if (classes.empty()) {
+        return {};
+    }
+
+    std::vector<unsigned char> allowed_classes(static_cast<std::size_t>(std::max(num_classes, 0)), 0);
+    for (int class_index : classes) {
+        if (class_index >= 0 && class_index < num_classes) {
+            allowed_classes[static_cast<std::size_t>(class_index)] = static_cast<unsigned char>(1);
+        }
+    }
+    return allowed_classes;
+}
+
+ncnn::Mat create_yolo_postprocess_config_mat(
+    float conf_threshold,
+    float iou_threshold,
+    int max_det,
+    int max_nms,
+    int num_classes,
+    bool agnostic_nms,
+    const std::vector<int>& input_shape,
+    const std::vector<int>& orig_shape,
+    const std::vector<int>& classes)
+{
+    ncnn::Mat config_mat(10 + std::max(num_classes, 0));
+    if (config_mat.empty()) {
+        throw std::runtime_error("Failed to allocate YOLO postprocess config tensor.");
+    }
+
+    float* config_ptr = static_cast<float*>(config_mat.data);
+    config_ptr[0] = conf_threshold;
+    config_ptr[1] = iou_threshold;
+    config_ptr[2] = static_cast<float>(max_det);
+    config_ptr[3] = static_cast<float>(std::max(max_nms, 0));
+    config_ptr[4] = static_cast<float>(num_classes);
+    config_ptr[5] = agnostic_nms ? 1.f : 0.f;
+    config_ptr[6] = static_cast<float>(input_shape[0]);
+    config_ptr[7] = static_cast<float>(input_shape[1]);
+    config_ptr[8] = static_cast<float>(orig_shape[0]);
+    config_ptr[9] = static_cast<float>(orig_shape[1]);
+
+    const bool allow_all_classes = classes.empty();
+    for (int class_index = 0; class_index < num_classes; ++class_index) {
+        config_ptr[10 + class_index] = allow_all_classes ? 1.f : 0.f;
+    }
+    for (int class_index : classes) {
+        if (class_index >= 0 && class_index < num_classes) {
+            config_ptr[10 + class_index] = 1.f;
+        }
+    }
+    return config_mat;
+}
+
 struct YoloSegMaskFinalizeRecording
 {
     int orig_height = 0;
@@ -163,6 +272,7 @@ struct YoloSegMaskFinalizeRecording
     ncnn::VkMat input_masks_blob;
     ncnn::VkMat masks_blob;
     ncnn::Mat boxes_mat;
+    ncnn::Mat input_masks_mat;
     ncnn::Mat masks_mat;
 };
 
@@ -240,12 +350,12 @@ float proto_mask_logit_at(
     int det_index,
     int y,
     int x,
-    int crop_x1,
-    int crop_y1,
-    int crop_x2,
-    int crop_y2)
+    float crop_x1,
+    float crop_y1,
+    float crop_x2,
+    float crop_y2)
 {
-    if (y < crop_y1 || y >= crop_y2 || x < crop_x1 || x >= crop_x2)
+    if (float(y) < crop_y1 || float(y) >= crop_y2 || float(x) < crop_x1 || float(x) >= crop_x2)
         return 0.0;
 
     float value = 0.0;
@@ -260,10 +370,10 @@ float binary_input_mask_value(
     int det_index,
     int input_y,
     int input_x,
-    int crop_x1,
-    int crop_y1,
-    int crop_x2,
-    int crop_y2)
+    float crop_x1,
+    float crop_y1,
+    float crop_x2,
+    float crop_y2)
 {
     if (input_y < 0 || input_y >= p.input_height || input_x < 0 || input_x >= p.input_width)
         return 0.0;
@@ -311,10 +421,10 @@ void main()
     const float x2 = selected_value_at(det_index, 2);
     const float y2 = selected_value_at(det_index, 3);
 
-    const int crop_x1 = max(0, int(roundEven(x1 * float(proto_width) / float(p.input_width))));
-    const int crop_y1 = max(0, int(roundEven(y1 * float(proto_height) / float(p.input_height))));
-    const int crop_x2 = min(proto_width, int(roundEven(x2 * float(proto_width) / float(p.input_width))));
-    const int crop_y2 = min(proto_height, int(roundEven(y2 * float(proto_height) / float(p.input_height))));
+    const float crop_x1 = x1 * float(proto_width) / float(p.input_width);
+    const float crop_y1 = y1 * float(proto_height) / float(p.input_height);
+    const float crop_x2 = x2 * float(proto_width) / float(p.input_width);
+    const float crop_y2 = y2 * float(proto_height) / float(p.input_height);
 
     const float gain = min(
         float(p.input_height) / float(p.orig_height),
@@ -452,11 +562,11 @@ void main()
     const float y1 = selected_value_at(det_index, 1);
     const float x2 = selected_value_at(det_index, 2);
     const float y2 = selected_value_at(det_index, 3);
-    const int crop_x1 = max(0, int(roundEven(x1 * float(proto_width) / float(p.input_width))));
-    const int crop_y1 = max(0, int(roundEven(y1 * float(proto_height) / float(p.input_height))));
-    const int crop_x2 = min(proto_width, int(roundEven(x2 * float(proto_width) / float(p.input_width))));
-    const int crop_y2 = min(proto_height, int(roundEven(y2 * float(proto_height) / float(p.input_height))));
-    if (y < crop_y1 || y >= crop_y2 || x < crop_x1 || x >= crop_x2)
+    const float crop_x1 = x1 * float(proto_width) / float(p.input_width);
+    const float crop_y1 = y1 * float(proto_height) / float(p.input_height);
+    const float crop_x2 = x2 * float(proto_width) / float(p.input_width);
+    const float crop_y2 = y2 * float(proto_height) / float(p.input_height);
+    if (float(y) < crop_y1 || float(y) >= crop_y2 || float(x) < crop_x1 || float(x) >= crop_x2)
     {
         proto_logit_store(det_index, y, x, 0.0);
         return;
@@ -631,6 +741,41 @@ float read_input_value(int y, int x, int channel)
     return float(load_input_byte(byte_index));
 }
 
+int saturate_cast_short_exact(float value)
+{
+    const int rounded = int(value + (value >= 0.0 ? 0.5 : -0.5));
+    return clamp(rounded, -32768, 32767);
+}
+
+int horizontal_resize_exact(int src_y, int inner_x, int channel)
+{
+    if (p.src_w <= 1 || p.resized_w <= 1)
+    {
+        return (int(read_input_value(src_y, 0, channel)) * 2048) >> 4;
+    }
+
+    float fx = (float(inner_x) + 0.5) * float(p.src_w) / float(p.resized_w) - 0.5;
+    int sx = int(floor(fx));
+    fx -= float(sx);
+
+    if (sx < 0)
+    {
+        sx = 0;
+        fx = 0.0;
+    }
+    if (sx >= p.src_w - 1)
+    {
+        sx = p.src_w - 2;
+        fx = 1.0;
+    }
+
+    const int a0 = saturate_cast_short_exact((1.0 - fx) * 2048.0);
+    const int a1 = saturate_cast_short_exact(fx * 2048.0);
+    const int s0 = int(read_input_value(src_y, sx, channel));
+    const int s1 = int(read_input_value(src_y, sx + 1, channel));
+    return (s0 * a0 + s1 * a1) >> 4;
+}
+
 float sample_resized_value(int y, int x, int channel)
 {
     const int inner_x = x - p.pad_left;
@@ -638,24 +783,37 @@ float sample_resized_value(int y, int x, int channel)
     if (inner_x < 0 || inner_x >= p.resized_w || inner_y < 0 || inner_y >= p.resized_h)
         return 114.0 / 255.0;
 
-    const float src_x = (float(inner_x) + 0.5) * float(p.src_w) / float(p.resized_w) - 0.5;
-    const float src_y = (float(inner_y) + 0.5) * float(p.src_h) / float(p.resized_h) - 0.5;
-    const int x0 = clamp(int(floor(src_x)), 0, p.src_w - 1);
-    const int y0 = clamp(int(floor(src_y)), 0, p.src_h - 1);
-    const int x1 = min(x0 + 1, p.src_w - 1);
-    const int y1 = min(y0 + 1, p.src_h - 1);
-    const float lx = src_x - float(x0);
-    const float ly = src_y - float(y0);
-    const float hx = 1.0 - lx;
-    const float hy = 1.0 - ly;
+    int sy0 = 0;
+    int sy1 = 0;
+    int b0 = 2048;
+    int b1 = 0;
+    if (p.src_h > 1 && p.resized_h > 1)
+    {
+        float fy = (float(inner_y) + 0.5) * float(p.src_h) / float(p.resized_h) - 0.5;
+        int sy = int(floor(fy));
+        fy -= float(sy);
 
-    const float v00 = read_input_value(y0, x0, channel);
-    const float v01 = read_input_value(y0, x1, channel);
-    const float v10 = read_input_value(y1, x0, channel);
-    const float v11 = read_input_value(y1, x1, channel);
-    const float top = v00 * hx + v01 * lx;
-    const float bottom = v10 * hx + v11 * lx;
-    return (top * hy + bottom * ly) / 255.0;
+        if (sy < 0)
+        {
+            sy = 0;
+            fy = 0.0;
+        }
+        if (sy >= p.src_h - 1)
+        {
+            sy = p.src_h - 2;
+            fy = 1.0;
+        }
+
+        sy0 = sy;
+        sy1 = sy + 1;
+        b0 = saturate_cast_short_exact((1.0 - fy) * 2048.0);
+        b1 = saturate_cast_short_exact(fy * 2048.0);
+    }
+
+    const int rows0 = horizontal_resize_exact(sy0, inner_x, channel);
+    const int rows1 = horizontal_resize_exact(sy1, inner_x, channel);
+    const int value = (((b0 * rows0) >> 16) + ((b1 * rows1) >> 16) + 2) >> 2;
+    return float(clamp(value, 0, 255)) / 255.0;
 }
 
 void main()
@@ -668,6 +826,207 @@ void main()
 
     const float value = sample_resized_value(y, x, c);
     buffer_st1(output_blob_data, c * p.output_cstep + y * p.dst_w + x, afp(value));
+}
+)";
+
+static const char kLadaYoloPreprocessShaderPackedFp16[] = R"(
+#version 450
+
+layout(binding = 0) readonly buffer input_blob { uint input_blob_data[]; };
+layout(binding = 1) buffer output_blob { uint output_blob_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int src_w;
+    int src_h;
+    int dst_w;
+    int dst_h;
+    int resized_w;
+    int resized_h;
+    int pad_left;
+    int pad_top;
+    int output_cstep;
+} p;
+
+uint load_input_byte(int byte_index)
+{
+    const int word_index = byte_index >> 2;
+    const int byte_offset = (byte_index & 3) * 8;
+    return (input_blob_data[word_index] >> uint(byte_offset)) & 255u;
+}
+
+float read_input_value(int y, int x, int channel)
+{
+    const int byte_index = ((y * p.src_w + x) * 3) + channel;
+    return float(load_input_byte(byte_index));
+}
+
+int saturate_cast_short_exact(float value)
+{
+    const int rounded = int(value + (value >= 0.0 ? 0.5 : -0.5));
+    return clamp(rounded, -32768, 32767);
+}
+
+int horizontal_resize_exact(int src_y, int inner_x, int channel)
+{
+    if (p.src_w <= 1 || p.resized_w <= 1)
+    {
+        return (int(read_input_value(src_y, 0, channel)) * 2048) >> 4;
+    }
+
+    float fx = (float(inner_x) + 0.5) * float(p.src_w) / float(p.resized_w) - 0.5;
+    int sx = int(floor(fx));
+    fx -= float(sx);
+
+    if (sx < 0)
+    {
+        sx = 0;
+        fx = 0.0;
+    }
+    if (sx >= p.src_w - 1)
+    {
+        sx = p.src_w - 2;
+        fx = 1.0;
+    }
+
+    const int a0 = saturate_cast_short_exact((1.0 - fx) * 2048.0);
+    const int a1 = saturate_cast_short_exact(fx * 2048.0);
+    const int s0 = int(read_input_value(src_y, sx, channel));
+    const int s1 = int(read_input_value(src_y, sx + 1, channel));
+    return (s0 * a0 + s1 * a1) >> 4;
+}
+
+float sample_resized_value(int y, int x, int channel)
+{
+    const int inner_x = x - p.pad_left;
+    const int inner_y = y - p.pad_top;
+    if (inner_x < 0 || inner_x >= p.resized_w || inner_y < 0 || inner_y >= p.resized_h)
+        return 114.0 / 255.0;
+
+    int sy0 = 0;
+    int sy1 = 0;
+    int b0 = 2048;
+    int b1 = 0;
+    if (p.src_h > 1 && p.resized_h > 1)
+    {
+        float fy = (float(inner_y) + 0.5) * float(p.src_h) / float(p.resized_h) - 0.5;
+        int sy = int(floor(fy));
+        fy -= float(sy);
+
+        if (sy < 0)
+        {
+            sy = 0;
+            fy = 0.0;
+        }
+        if (sy >= p.src_h - 1)
+        {
+            sy = p.src_h - 2;
+            fy = 1.0;
+        }
+
+        sy0 = sy;
+        sy1 = sy + 1;
+        b0 = saturate_cast_short_exact((1.0 - fy) * 2048.0);
+        b1 = saturate_cast_short_exact(fy * 2048.0);
+    }
+
+    const int rows0 = horizontal_resize_exact(sy0, inner_x, channel);
+    const int rows1 = horizontal_resize_exact(sy1, inner_x, channel);
+    const int value = (((b0 * rows0) >> 16) + ((b1 * rows1) >> 16) + 2) >> 2;
+    return float(clamp(value, 0, 255)) / 255.0;
+}
+
+uint float32_to_half_rte(float value)
+{
+    const uint bits = floatBitsToUint(value);
+    const uint sign = (bits >> 16) & 0x8000u;
+    const uint exponent = (bits >> 23) & 0xffu;
+    uint mantissa = bits & 0x007fffffu;
+
+    if (exponent == 255u)
+    {
+        if (mantissa == 0u)
+            return sign | 0x7c00u;
+
+        uint payload = mantissa >> 13;
+        if (payload == 0u)
+            payload = 1u;
+        return sign | 0x7c00u | payload;
+    }
+
+    int half_exponent = int(exponent) - 127 + 15;
+    if (half_exponent >= 31)
+        return sign | 0x7c00u;
+
+    if (half_exponent <= 0)
+    {
+        if (half_exponent < -10)
+            return sign;
+
+        mantissa |= 0x00800000u;
+        const uint shift = uint(14 - half_exponent);
+        uint half_mantissa = mantissa >> shift;
+        const uint round_mask = (1u << shift) - 1u;
+        const uint round_bits = mantissa & round_mask;
+        const uint halfway = 1u << (shift - 1u);
+        if (round_bits > halfway || (round_bits == halfway && (half_mantissa & 1u) != 0u))
+        {
+            half_mantissa += 1u;
+            if (half_mantissa == 0x0400u)
+                return sign | 0x0400u;
+        }
+        return sign | half_mantissa;
+    }
+
+    uint half_mantissa = mantissa >> 13;
+    uint half_bits = uint(half_exponent) << 10;
+    const uint round_bits = mantissa & 0x1fffu;
+    if (round_bits > 0x1000u || (round_bits == 0x1000u && (half_mantissa & 1u) != 0u))
+    {
+        half_mantissa += 1u;
+        if (half_mantissa == 0x0400u)
+        {
+            half_mantissa = 0u;
+            half_bits += 0x0400u;
+            if (half_bits >= 0x7c00u)
+                return sign | 0x7c00u;
+        }
+    }
+
+    return sign | half_bits | half_mantissa;
+}
+
+void store_output_half(int index, float value)
+{
+    const uint half_value = float32_to_half_rte(value);
+    const uint word_index = uint(index) >> 1;
+    const uint lane_index = uint(index) & 1u;
+    uint old_word = 0u;
+    uint new_word = 0u;
+    do
+    {
+        old_word = atomicCompSwap(output_blob_data[word_index], 0u, 0u);
+        if (lane_index == 0u)
+        {
+            new_word = (old_word & 0xffff0000u) | half_value;
+        }
+        else
+        {
+            new_word = (old_word & 0x0000ffffu) | (half_value << 16);
+        }
+    } while (atomicCompSwap(output_blob_data[word_index], old_word, new_word) != old_word);
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    const int c = int(gl_GlobalInvocationID.z);
+    if (x >= p.dst_w || y >= p.dst_h || c >= 3)
+        return;
+
+    const float value = sample_resized_value(y, x, c);
+    store_output_half(c * p.output_cstep + y * p.dst_w + x, value);
 }
 )";
 
@@ -691,7 +1050,81 @@ ncnn::Mat download_vulkan_tensor_to_cpu_mat(const LadaVulkanTensor& tensor)
     if (ret != 0) {
         throw std::runtime_error("Failed to download Vulkan tensor from ncnn.");
     }
+
+    const size_t packed_elemsize = output.elemsize * static_cast<size_t>(output.elempack);
+
+    if (output.dims == 3) {
+        ncnn::Mat tight(output.w, output.h, output.c, output.elemsize, output.elempack);
+        if (tight.empty()) {
+            throw std::runtime_error("Failed to allocate tight CPU clone for downloaded Vulkan tensor.");
+        }
+        const size_t channel_bytes =
+            static_cast<size_t>(output.w) * static_cast<size_t>(output.h) * packed_elemsize;
+        for (int channel_index = 0; channel_index < output.c; ++channel_index) {
+            std::memcpy(tight.channel(channel_index), output.channel(channel_index), channel_bytes);
+        }
+        return tight;
+    }
+
+    if (output.dims == 2) {
+        ncnn::Mat tight(output.w, output.h, output.elemsize, output.elempack);
+        if (tight.empty()) {
+            throw std::runtime_error("Failed to allocate tight CPU clone for downloaded Vulkan tensor.");
+        }
+        const size_t total_bytes =
+            static_cast<size_t>(output.w) * static_cast<size_t>(output.h) * packed_elemsize;
+        std::memcpy(tight.data, output.data, total_bytes);
+        return tight;
+    }
+
+    if (output.dims == 1) {
+        ncnn::Mat tight(output.w, output.elemsize, output.elempack);
+        if (tight.empty()) {
+            throw std::runtime_error("Failed to allocate tight CPU clone for downloaded Vulkan tensor.");
+        }
+        const size_t total_bytes = static_cast<size_t>(output.w) * packed_elemsize;
+        std::memcpy(tight.data, output.data, total_bytes);
+        return tight;
+    }
+
     return output.clone();
+}
+
+LadaVulkanTensor upload_cpu_mat_to_vulkan_tensor(
+    const ncnn::Mat& mat,
+    const std::shared_ptr<LadaVulkanContext>& context)
+{
+    if (!context) {
+        throw std::runtime_error("Vulkan upload context is missing.");
+    }
+
+    ncnn::Option opt = context->net->opt;
+    opt.use_vulkan_compute = true;
+    opt.use_packing_layout = false;
+    opt.blob_vkallocator = context->blob_vkallocator;
+    opt.workspace_vkallocator = context->blob_vkallocator;
+    opt.staging_vkallocator = context->staging_vkallocator;
+
+    ncnn::VkCompute cmd(context->vkdev);
+    ncnn::VkMat gpu_mat;
+    if (mat.dims == 3) {
+        gpu_mat.create(mat.w, mat.h, mat.c, mat.elemsize, mat.elempack, opt.blob_vkallocator);
+    } else if (mat.dims == 2) {
+        gpu_mat.create(mat.w, mat.h, mat.elemsize, mat.elempack, opt.blob_vkallocator);
+    } else if (mat.dims == 1) {
+        gpu_mat.create(mat.w, mat.elemsize, mat.elempack, opt.blob_vkallocator);
+    } else {
+        throw std::runtime_error("Unsupported NCNN tensor rank for Vulkan upload.");
+    }
+    if (gpu_mat.empty()) {
+        throw std::runtime_error("Failed to allocate Vulkan tensor for upload.");
+    }
+
+    cmd.record_upload(mat, gpu_mat, opt);
+    if (cmd.submit_and_wait() != 0) {
+        throw std::runtime_error("Failed to upload CPU tensor into Vulkan memory.");
+    }
+    return LadaVulkanTensor(std::move(gpu_mat), context);
 }
 
 void ensure_yolo_seg_mask_finalize_pipelines(LadaVulkanContext& context)
@@ -763,14 +1196,23 @@ void ensure_yolo_preprocess_pipeline(LadaVulkanContext& context)
     ncnn::Option opt = context.net->opt;
     opt.use_vulkan_compute = true;
     opt.use_packing_layout = false;
+    const bool use_fp16_storage = opt.use_fp16_storage || opt.use_fp16_packed;
+    opt.use_fp16_storage = false;
+    opt.use_fp16_packed = false;
+    opt.use_fp16_arithmetic = false;
+    opt.use_bf16_storage = false;
+    opt.use_bf16_packed = false;
     opt.blob_vkallocator = context.blob_vkallocator;
     opt.workspace_vkallocator = context.blob_vkallocator;
     opt.staging_vkallocator = context.staging_vkallocator;
 
     std::vector<uint32_t> spirv;
     const int compile_ret = ncnn::compile_spirv_module(
-        kLadaYoloPreprocessShader,
-        static_cast<int>(sizeof(kLadaYoloPreprocessShader) - 1),
+        use_fp16_storage ? kLadaYoloPreprocessShaderPackedFp16 : kLadaYoloPreprocessShader,
+        static_cast<int>(
+            use_fp16_storage
+                ? sizeof(kLadaYoloPreprocessShaderPackedFp16) - 1
+                : sizeof(kLadaYoloPreprocessShader) - 1),
         opt,
         spirv);
     if (compile_ret != 0) {
@@ -788,6 +1230,14 @@ void ensure_yolo_preprocess_pipeline(LadaVulkanContext& context)
         context.yolo_preprocess_pipeline = nullptr;
         throw std::runtime_error("Failed to create YOLO preprocess pipeline.");
     }
+}
+
+size_t resolve_yolo_preprocess_output_elemsize(const ncnn::Option& opt)
+{
+    if (opt.use_fp16_storage || opt.use_fp16_packed) {
+        return static_cast<size_t>(2u);
+    }
+    return static_cast<size_t>(4u);
 }
 
 py::dict finalize_yolo_segmentation_masks_gpu_py(
@@ -911,6 +1361,12 @@ public:
         opt.blob_vkallocator = context_->blob_vkallocator;
         opt.workspace_vkallocator = context_->blob_vkallocator;
         opt.staging_vkallocator = context_->staging_vkallocator;
+        ncnn::Option upload_opt = opt;
+        upload_opt.use_fp16_storage = false;
+        upload_opt.use_fp16_packed = false;
+        upload_opt.use_fp16_arithmetic = false;
+        upload_opt.use_bf16_storage = false;
+        upload_opt.use_bf16_packed = false;
 
         ncnn::VkCompute cmd(context_->vkdev);
         std::vector<ncnn::VkMat> outputs;
@@ -926,10 +1382,17 @@ public:
             if (input_blob.empty()) {
                 throw std::runtime_error("Failed to allocate YOLO preprocess Vulkan input tensor.");
             }
-            cmd.record_upload(packed.packed_input, input_blob, opt);
+            cmd.record_upload(packed.packed_input, input_blob, upload_opt);
 
+            ncnn::VkMat output_blob_fp32;
             ncnn::VkMat output_blob;
-            output_blob.create(dst_w, dst_h, 3, static_cast<size_t>(4u), 1, opt.blob_vkallocator);
+            output_blob.create(
+                dst_w,
+                dst_h,
+                3,
+                resolve_yolo_preprocess_output_elemsize(opt),
+                1,
+                opt.blob_vkallocator);
             if (output_blob.empty()) {
                 throw std::runtime_error("Failed to allocate YOLO preprocess Vulkan output tensor.");
             }
@@ -1014,6 +1477,12 @@ public:
         opt.blob_vkallocator = context_->blob_vkallocator;
         opt.workspace_vkallocator = context_->blob_vkallocator;
         opt.staging_vkallocator = context_->staging_vkallocator;
+        ncnn::Option upload_opt = opt;
+        upload_opt.use_fp16_storage = false;
+        upload_opt.use_fp16_packed = false;
+        upload_opt.use_fp16_arithmetic = false;
+        upload_opt.use_bf16_storage = false;
+        upload_opt.use_bf16_packed = false;
 
         ncnn::VkCompute cmd(context_->vkdev);
         ncnn::VkMat input_blob;
@@ -1021,10 +1490,16 @@ public:
         if (input_blob.empty()) {
             throw std::runtime_error("Failed to allocate YOLO preprocess Vulkan input tensor.");
         }
-        cmd.record_upload(packed_input, input_blob, opt);
+        cmd.record_upload(packed_input, input_blob, upload_opt);
 
         ncnn::VkMat output_blob;
-        output_blob.create(dst_w, dst_h, 3, static_cast<size_t>(4u), 1, opt.blob_vkallocator);
+        output_blob.create(
+            dst_w,
+            dst_h,
+            3,
+            resolve_yolo_preprocess_output_elemsize(opt),
+            1,
+            opt.blob_vkallocator);
         if (output_blob.empty()) {
             throw std::runtime_error("Failed to allocate YOLO preprocess Vulkan output tensor.");
         }
@@ -1051,10 +1526,16 @@ public:
         return LadaVulkanTensor(std::move(output_blob), context_);
     }
 
+    LadaVulkanTensor upload_cpu_mat(const ncnn::Mat& mat) const
+    {
+        return upload_cpu_mat_to_vulkan_tensor(mat, context_);
+    }
+
     LadaVulkanTensor run(const py::dict& inputs, const std::string& output_name = "out0") const
     {
         ncnn::Extractor extractor = create_extractor(false);
-        feed_inputs(extractor, inputs);
+        std::vector<LadaVulkanTensor> uploaded_inputs;
+        feed_inputs(extractor, inputs, &uploaded_inputs);
 
         ncnn::VkCompute extract_cmd(context_->vkdev);
         ncnn::VkMat output;
@@ -1074,7 +1555,8 @@ public:
     ncnn::Mat run_to_cpu(const py::dict& inputs, const std::string& output_name = "out0") const
     {
         ncnn::Extractor extractor = create_extractor(true);
-        feed_inputs(extractor, inputs);
+        std::vector<LadaVulkanTensor> uploaded_inputs;
+        feed_inputs(extractor, inputs, &uploaded_inputs);
 
         return extract_cpu_output(extractor, output_name);
     }
@@ -1084,7 +1566,8 @@ public:
         const std::vector<std::string>& output_names) const
     {
         ncnn::Extractor extractor = create_extractor(false);
-        feed_inputs(extractor, inputs);
+        std::vector<LadaVulkanTensor> uploaded_inputs;
+        feed_inputs(extractor, inputs, &uploaded_inputs);
 
         ncnn::VkCompute extract_cmd(context_->vkdev);
         py::dict outputs;
@@ -1110,9 +1593,14 @@ public:
         const py::dict& inputs,
         const std::vector<std::string>& output_names) const
     {
+        ncnn::Extractor extractor = create_extractor(true);
+        std::vector<LadaVulkanTensor> uploaded_inputs;
+        feed_inputs(extractor, inputs, &uploaded_inputs);
+
         py::dict outputs;
         for (const std::string& output_name : output_names) {
-            outputs[py::str(output_name)] = ncnn_mat_to_numpy(run_to_cpu(inputs, output_name));
+            outputs[py::str(output_name)] = ncnn_mat_to_numpy(
+                extract_cpu_output(extractor, output_name));
         }
         return outputs;
     }
@@ -1126,18 +1614,24 @@ public:
         float iou_threshold,
         int max_det,
         int num_classes,
-        bool agnostic_nms) const
+        bool agnostic_nms,
+        const std::vector<int>& classes,
+        int max_nms) const
     {
         if (input_shape.size() < 2 || orig_shape.size() < 2) {
             throw std::runtime_error("Input and original shapes must contain height and width.");
         }
+
+        ncnn::Extractor extractor = create_extractor(true);
+        std::vector<LadaVulkanTensor> uploaded_inputs;
+        feed_inputs(extractor, inputs, &uploaded_inputs);
 
         ncnn::Mat pred;
         ncnn::Mat proto;
         bool has_pred = false;
         bool has_proto = false;
         for (const std::string& output_name : output_names) {
-            ncnn::Mat output = run_to_cpu(inputs, output_name);
+            ncnn::Mat output = extract_cpu_output(extractor, output_name);
             if (!has_pred && output.dims == 2) {
                 pred = std::move(output);
                 has_pred = true;
@@ -1157,8 +1651,10 @@ public:
         config.conf_threshold = conf_threshold;
         config.iou_threshold = iou_threshold;
         config.max_det = max_det;
+        config.max_nms = max_nms;
         config.num_classes = num_classes;
         config.agnostic_nms = agnostic_nms;
+        config.allowed_classes = normalize_yolo_allowed_classes(num_classes, classes);
         config.input_height = input_shape[0];
         config.input_width = input_shape[1];
         config.orig_height = orig_shape[0];
@@ -1178,7 +1674,9 @@ public:
         float iou_threshold,
         int max_det,
         int num_classes,
-        bool agnostic_nms) const
+        bool agnostic_nms,
+        const std::vector<int>& classes,
+        int max_nms) const
     {
         if (context_->vkdev != postprocess_runner.context_->vkdev) {
             throw std::runtime_error("YOLO detector and postprocess runners must use the same Vulkan device.");
@@ -1187,28 +1685,19 @@ public:
             throw std::runtime_error("Input and original shapes must contain height and width.");
         }
 
-        ncnn::Extractor detector_extractor = create_extractor(true);
-        feed_inputs(detector_extractor, inputs);
-
-        ncnn::VkCompute detector_cmd(context_->vkdev);
-        ncnn::VkMat pred_blob;
-        ncnn::VkMat proto_blob;
+        ncnn::VkMat stable_pred_blob;
+        ncnn::VkMat stable_proto_blob;
         bool has_pred = false;
         bool has_proto = false;
         for (const std::string& output_name : output_names) {
-            ncnn::VkMat extracted_output;
-            const int extract_ret = detector_extractor.extract(output_name.c_str(), extracted_output, detector_cmd);
-            if (extract_ret != 0) {
-                throw std::runtime_error("Failed to record YOLO detector Vulkan output.");
-            }
-
-            if (!has_pred && extracted_output.dims == 2) {
-                pred_blob = extracted_output;
+            LadaVulkanTensor extracted_output = run(inputs, output_name);
+            if (!has_pred && extracted_output.blob.dims == 2) {
+                stable_pred_blob = clone_vulkan_blob_to_context(extracted_output.blob, postprocess_runner.context_);
                 has_pred = true;
                 continue;
             }
-            if (!has_proto && extracted_output.dims == 3) {
-                proto_blob = extracted_output;
+            if (!has_proto && extracted_output.blob.dims == 3) {
+                stable_proto_blob = clone_vulkan_blob_to_context(extracted_output.blob, postprocess_runner.context_);
                 has_proto = true;
             }
         }
@@ -1216,30 +1705,26 @@ public:
         if (!has_pred || !has_proto) {
             throw std::runtime_error("Failed to resolve YOLO segmentation outputs from Vulkan detector.");
         }
-        if (detector_cmd.submit_and_wait() != 0 || pred_blob.empty() || proto_blob.empty()) {
+        if (stable_pred_blob.empty() || stable_proto_blob.empty()) {
             throw std::runtime_error("Failed to finalize YOLO detector Vulkan outputs.");
         }
 
-        ncnn::Mat config_mat(9);
-        if (config_mat.empty()) {
-            throw std::runtime_error("Failed to allocate YOLO postprocess config tensor.");
-        }
-        float* config_ptr = static_cast<float*>(config_mat.data);
-        config_ptr[0] = conf_threshold;
-        config_ptr[1] = iou_threshold;
-        config_ptr[2] = static_cast<float>(max_det);
-        config_ptr[3] = static_cast<float>(num_classes);
-        config_ptr[4] = agnostic_nms ? 1.f : 0.f;
-        config_ptr[5] = static_cast<float>(input_shape[0]);
-        config_ptr[6] = static_cast<float>(input_shape[1]);
-        config_ptr[7] = static_cast<float>(orig_shape[0]);
-        config_ptr[8] = static_cast<float>(orig_shape[1]);
+        ncnn::Mat config_mat = create_yolo_postprocess_config_mat(
+            conf_threshold,
+            iou_threshold,
+            max_det,
+            max_nms,
+            num_classes,
+            agnostic_nms,
+            input_shape,
+            orig_shape,
+            classes);
 
         ncnn::Extractor postprocess_extractor = postprocess_runner.create_extractor(true);
-        if (postprocess_extractor.input("pred", pred_blob) != 0) {
+        if (postprocess_extractor.input("pred", stable_pred_blob) != 0) {
             throw std::runtime_error("Failed to feed YOLO prediction tensor into Vulkan postprocess subnet.");
         }
-        if (postprocess_extractor.input("proto", proto_blob) != 0) {
+        if (postprocess_extractor.input("proto", stable_proto_blob) != 0) {
             throw std::runtime_error("Failed to feed YOLO proto tensor into Vulkan postprocess subnet.");
         }
         if (postprocess_extractor.input("config", config_mat) != 0) {
@@ -1287,16 +1772,19 @@ public:
             throw std::runtime_error("Downloaded YOLO count tensor has an unexpected shape or dtype.");
         }
 
-        const int output_capacity = std::min(boxes_blob.h, selected_blob.h);
+        ncnn::VkMat stable_boxes_blob = clone_vulkan_blob_to_context(boxes_blob, postprocess_runner.context_);
+        ncnn::VkMat stable_selected_blob = clone_vulkan_blob_to_context(selected_blob, postprocess_runner.context_);
+
+        const int output_capacity = std::min(stable_boxes_blob.h, stable_selected_blob.h);
         const int count = std::clamp(
             static_cast<int>(static_cast<const float*>(count_mat.data)[0]),
             0,
             output_capacity);
         return finalize_yolo_segmentation_masks_gpu_impl(
             postprocess_runner.context_,
-            boxes_blob,
-            selected_blob,
-            proto_blob,
+            stable_boxes_blob,
+            stable_selected_blob,
+            stable_proto_blob,
             count,
             input_shape,
             orig_shape);
@@ -1313,7 +1801,9 @@ public:
         float iou_threshold,
         int max_det,
         int num_classes,
-        bool agnostic_nms) const
+        bool agnostic_nms,
+        const std::vector<int>& classes,
+        int max_nms) const
     {
         if (context_->vkdev != postprocess_runner.context_->vkdev) {
             throw std::runtime_error("YOLO detector and postprocess runners must use the same Vulkan device.");
@@ -1329,184 +1819,28 @@ public:
         if (batch_size == 0) {
             return py::list();
         }
-
-        struct BatchState
-        {
-            ncnn::VkMat pred_blob;
-            ncnn::VkMat proto_blob;
-            ncnn::VkMat boxes_blob;
-            ncnn::VkMat selected_blob;
-            ncnn::Mat count_mat;
-        };
-
-        std::vector<BatchState> states(batch_size);
-        {
-            ncnn::VkCompute detector_cmd(context_->vkdev);
-            std::vector<ncnn::Extractor> detector_extractors;
-            detector_extractors.reserve(batch_size);
-
-            for (std::size_t frame_index = 0; frame_index < batch_size; ++frame_index) {
-                detector_extractors.push_back(create_extractor(true));
-                ncnn::Extractor& detector_extractor = detector_extractors.back();
-                feed_input(
-                    detector_extractor,
-                    input_name,
-                    input_frames[static_cast<py::ssize_t>(frame_index)]);
-
-                bool has_pred = false;
-                bool has_proto = false;
-                for (const std::string& output_name : output_names) {
-                    ncnn::VkMat extracted_output;
-                    const int extract_ret = detector_extractor.extract(
-                        output_name.c_str(),
-                        extracted_output,
-                        detector_cmd);
-                    if (extract_ret != 0) {
-                        throw std::runtime_error("Failed to record YOLO detector Vulkan output.");
-                    }
-
-                    if (!has_pred && extracted_output.dims == 2) {
-                        states[frame_index].pred_blob = extracted_output;
-                        has_pred = true;
-                        continue;
-                    }
-                    if (!has_proto && extracted_output.dims == 3) {
-                        states[frame_index].proto_blob = extracted_output;
-                        has_proto = true;
-                    }
-                }
-
-                if (!has_pred || !has_proto) {
-                    throw std::runtime_error("Failed to resolve YOLO segmentation outputs from Vulkan detector.");
-                }
-            }
-
-            if (detector_cmd.submit_and_wait() != 0) {
-                throw std::runtime_error("Failed to finalize YOLO detector Vulkan batch outputs.");
-            }
-        }
-
-        ncnn::Option postprocess_opt = postprocess_runner.context_->net->opt;
-        postprocess_opt.use_vulkan_compute = true;
-        postprocess_opt.use_packing_layout = false;
-        postprocess_opt.blob_vkallocator = postprocess_runner.context_->blob_vkallocator;
-        postprocess_opt.workspace_vkallocator = postprocess_runner.context_->blob_vkallocator;
-        postprocess_opt.staging_vkallocator = postprocess_runner.context_->staging_vkallocator;
-
-        {
-            ncnn::VkCompute postprocess_cmd(context_->vkdev);
-            std::vector<ncnn::Extractor> postprocess_extractors;
-            postprocess_extractors.reserve(batch_size);
-            std::vector<ncnn::Mat> config_mats(batch_size);
-
-            for (std::size_t frame_index = 0; frame_index < batch_size; ++frame_index) {
-                const std::vector<int>& orig_shape = orig_shapes[frame_index];
-                if (orig_shape.size() < 2) {
-                    throw std::runtime_error("Each YOLO original shape must contain height and width.");
-                }
-
-                ncnn::Mat& config_mat = config_mats[frame_index];
-                config_mat = ncnn::Mat(9);
-                if (config_mat.empty()) {
-                    throw std::runtime_error("Failed to allocate YOLO postprocess config tensor.");
-                }
-                float* config_ptr = static_cast<float*>(config_mat.data);
-                config_ptr[0] = conf_threshold;
-                config_ptr[1] = iou_threshold;
-                config_ptr[2] = static_cast<float>(max_det);
-                config_ptr[3] = static_cast<float>(num_classes);
-                config_ptr[4] = agnostic_nms ? 1.f : 0.f;
-                config_ptr[5] = static_cast<float>(input_shape[0]);
-                config_ptr[6] = static_cast<float>(input_shape[1]);
-                config_ptr[7] = static_cast<float>(orig_shape[0]);
-                config_ptr[8] = static_cast<float>(orig_shape[1]);
-
-                postprocess_extractors.push_back(postprocess_runner.create_extractor(true));
-                ncnn::Extractor& postprocess_extractor = postprocess_extractors.back();
-                if (postprocess_extractor.input("pred", states[frame_index].pred_blob) != 0) {
-                    throw std::runtime_error(
-                        "Failed to feed YOLO prediction tensor into Vulkan postprocess subnet.");
-                }
-                if (postprocess_extractor.input("proto", states[frame_index].proto_blob) != 0) {
-                    throw std::runtime_error(
-                        "Failed to feed YOLO proto tensor into Vulkan postprocess subnet.");
-                }
-                if (postprocess_extractor.input("config", config_mat) != 0) {
-                    throw std::runtime_error("Failed to feed YOLO config tensor into Vulkan postprocess subnet.");
-                }
-
-                {
-                    ncnn::VkMat extracted_boxes;
-                    if (postprocess_extractor.extract("boxes", extracted_boxes, postprocess_cmd) != 0) {
-                        throw std::runtime_error(
-                            "Failed to extract YOLO boxes tensor from Vulkan postprocess subnet.");
-                    }
-                    states[frame_index].boxes_blob = extracted_boxes;
-                }
-                {
-                    ncnn::VkMat extracted_selected;
-                    if (postprocess_extractor.extract("selected", extracted_selected, postprocess_cmd) != 0) {
-                        throw std::runtime_error(
-                            "Failed to extract YOLO selected tensor from Vulkan postprocess subnet.");
-                    }
-                    states[frame_index].selected_blob = extracted_selected;
-                }
-                {
-                    ncnn::VkMat extracted_count;
-                    if (postprocess_extractor.extract("count", extracted_count, postprocess_cmd) != 0) {
-                        throw std::runtime_error(
-                            "Failed to extract YOLO count tensor from Vulkan postprocess subnet.");
-                    }
-                    postprocess_cmd.record_download(
-                        extracted_count,
-                        states[frame_index].count_mat,
-                        postprocess_opt);
-                }
-            }
-
-            if (postprocess_cmd.submit_and_wait() != 0) {
-                throw std::runtime_error("Failed to finalize YOLO postprocess Vulkan batch outputs.");
-            }
-        }
-
-        std::vector<YoloSegMaskFinalizeRecording> finalize_recordings(batch_size);
-        bool has_finalize_work = false;
-        {
-            ncnn::VkCompute finalize_cmd(context_->vkdev);
-            for (std::size_t frame_index = 0; frame_index < batch_size; ++frame_index) {
-                if (states[frame_index].count_mat.dims != 1
-                    || states[frame_index].count_mat.w < 1
-                    || states[frame_index].count_mat.elemsize != sizeof(float)) {
-                    throw std::runtime_error("Downloaded YOLO count tensor has an unexpected shape or dtype.");
-                }
-
-                const int output_capacity = std::min(
-                    states[frame_index].boxes_blob.h,
-                    states[frame_index].selected_blob.h);
-                const int count = std::clamp(
-                    static_cast<int>(static_cast<const float*>(states[frame_index].count_mat.data)[0]),
-                    0,
-                    output_capacity);
-                finalize_recordings[frame_index] = record_yolo_segmentation_masks_gpu_finalize(
-                    postprocess_runner.context_,
-                    states[frame_index].boxes_blob,
-                    states[frame_index].selected_blob,
-                    states[frame_index].proto_blob,
-                    count,
-                    input_shape,
-                    orig_shapes[frame_index],
-                    finalize_cmd);
-                has_finalize_work = has_finalize_work || count > 0;
-            }
-
-            if (has_finalize_work && finalize_cmd.submit_and_wait() != 0) {
-                throw std::runtime_error("Failed to execute YOLO Vulkan mask finalize batch pipeline.");
-            }
-        }
-
         py::list results;
         for (std::size_t frame_index = 0; frame_index < batch_size; ++frame_index) {
-            results.append(pack_yolo_segmentation_masks_gpu_finalize(finalize_recordings[frame_index]));
+            const std::vector<int>& orig_shape = orig_shapes[frame_index];
+            if (orig_shape.size() < 2) {
+                throw std::runtime_error("Each YOLO original shape must contain height and width.");
+            }
+
+            py::dict single_input;
+            single_input[py::str(input_name)] = input_frames[static_cast<py::ssize_t>(frame_index)];
+            results.append(run_yolo_segmentation_subnet(
+                single_input,
+                output_names,
+                postprocess_runner,
+                input_shape,
+                orig_shape,
+                conf_threshold,
+                iou_threshold,
+                max_det,
+                num_classes,
+                agnostic_nms,
+                classes,
+                max_nms));
         }
         return results;
     }
@@ -1522,20 +1856,28 @@ private:
         return extractor;
     }
 
-    void feed_inputs(ncnn::Extractor& extractor, const py::dict& inputs) const
+    void feed_inputs(
+        ncnn::Extractor& extractor,
+        const py::dict& inputs,
+        std::vector<LadaVulkanTensor>* uploaded_inputs) const
     {
+        if (uploaded_inputs != nullptr) {
+            uploaded_inputs->reserve(uploaded_inputs->size() + static_cast<std::size_t>(py::len(inputs)));
+        }
         for (const auto& item : inputs) {
             feed_input(
                 extractor,
                 py::cast<std::string>(item.first),
-                item.second);
+                item.second,
+                uploaded_inputs);
         }
     }
 
     void feed_input(
         ncnn::Extractor& extractor,
         const std::string& blob_name,
-        const py::handle& value) const
+        const py::handle& value,
+        std::vector<LadaVulkanTensor>* uploaded_inputs = nullptr) const
     {
         if (py::isinstance<LadaVulkanTensor>(value)) {
             const auto& tensor = value.cast<const LadaVulkanTensor&>();
@@ -1554,9 +1896,14 @@ private:
 
         if (py::isinstance<ncnn::Mat>(value)) {
             const auto& mat = value.cast<const ncnn::Mat&>();
-            const int ret = extractor.input(blob_name.c_str(), mat);
+            if (uploaded_inputs == nullptr) {
+                throw std::runtime_error("Uploaded Vulkan input storage is required for CPU NCNN tensors.");
+            }
+            uploaded_inputs->push_back(upload_cpu_mat_to_vulkan_tensor(mat, context_));
+            const LadaVulkanTensor& uploaded = uploaded_inputs->back();
+            const int ret = extractor.input(blob_name.c_str(), uploaded.blob);
             if (ret != 0) {
-                throw std::runtime_error("Failed to feed CPU tensor into ncnn extractor.");
+                throw std::runtime_error("Failed to feed uploaded CPU tensor into ncnn extractor.");
             }
             return;
         }
@@ -1676,110 +2023,85 @@ YoloSegMaskFinalizeRecording record_yolo_segmentation_masks_gpu_finalize(
     if (recording.masks_blob.empty()) {
         throw std::runtime_error("Failed to allocate YOLO Vulkan mask output tensor.");
     }
-    if (recording.selected_unpacked.elemsize == sizeof(float)) {
-        recording.proto_logits_blob.create(
-            proto_width,
-            proto_height,
-            count,
-            recording.selected_unpacked.elemsize,
-            1,
-            opt.workspace_vkallocator);
-        recording.input_masks_blob.create(
-            input_width,
-            input_height,
-            count,
-            recording.selected_unpacked.elemsize,
-            1,
-            opt.workspace_vkallocator);
-        if (recording.proto_logits_blob.empty() || recording.input_masks_blob.empty()) {
-            throw std::runtime_error("Failed to allocate staged YOLO Vulkan mask buffers.");
-        }
+    recording.proto_logits_blob.create(
+        proto_width,
+        proto_height,
+        count,
+        recording.selected_unpacked.elemsize,
+        1,
+        opt.workspace_vkallocator);
+    recording.input_masks_blob.create(
+        input_width,
+        input_height,
+        count,
+        recording.selected_unpacked.elemsize,
+        1,
+        opt.workspace_vkallocator);
+    if (recording.proto_logits_blob.empty() || recording.input_masks_blob.empty()) {
+        throw std::runtime_error("Failed to allocate staged YOLO Vulkan mask buffers.");
+    }
 
-        {
-            std::vector<ncnn::VkMat> bindings(3);
-            bindings[0] = recording.selected_unpacked;
-            bindings[1] = recording.proto_unpacked;
-            bindings[2] = recording.proto_logits_blob;
-
-            std::vector<ncnn::vk_constant_type> constants(9);
-            constants[0].i = recording.selected_unpacked.w;
-            constants[1].i = recording.proto_unpacked.w;
-            constants[2].i = recording.proto_unpacked.h;
-            constants[3].i = recording.proto_unpacked.c;
-            constants[4].i = proto_is_chw ? 1 : 0;
-            constants[5].i = mask_dim;
-            constants[6].i = count;
-            constants[7].i = input_height;
-            constants[8].i = input_width;
-            cmd.record_pipeline(
-                context->yolo_seg_mask_proto_decode_pipeline,
-                bindings,
-                constants,
-                recording.proto_logits_blob);
-        }
-
-        {
-            std::vector<ncnn::VkMat> bindings(2);
-            bindings[0] = recording.proto_logits_blob;
-            bindings[1] = recording.input_masks_blob;
-
-            std::vector<ncnn::vk_constant_type> constants(5);
-            constants[0].i = proto_width;
-            constants[1].i = proto_height;
-            constants[2].i = count;
-            constants[3].i = input_height;
-            constants[4].i = input_width;
-            cmd.record_pipeline(
-                context->yolo_seg_mask_input_resize_pipeline,
-                bindings,
-                constants,
-                recording.input_masks_blob);
-        }
-
-        {
-            std::vector<ncnn::VkMat> bindings(2);
-            bindings[0] = recording.input_masks_blob;
-            bindings[1] = recording.masks_blob;
-
-            std::vector<ncnn::vk_constant_type> constants(5);
-            constants[0].i = input_width;
-            constants[1].i = input_height;
-            constants[2].i = count;
-            constants[3].i = orig_height;
-            constants[4].i = orig_width;
-            cmd.record_pipeline(
-                context->yolo_seg_mask_orig_resize_pipeline,
-                bindings,
-                constants,
-                recording.masks_blob);
-        }
-    } else {
+    {
         std::vector<ncnn::VkMat> bindings(3);
         bindings[0] = recording.selected_unpacked;
         bindings[1] = recording.proto_unpacked;
-        bindings[2] = recording.masks_blob;
+        bindings[2] = recording.proto_logits_blob;
 
-        std::vector<ncnn::vk_constant_type> constants(12);
+        std::vector<ncnn::vk_constant_type> constants(9);
         constants[0].i = recording.selected_unpacked.w;
-        constants[1].i = recording.selected_unpacked.h;
-        constants[2].i = recording.proto_unpacked.w;
-        constants[3].i = recording.proto_unpacked.h;
-        constants[4].i = recording.proto_unpacked.c;
-        constants[5].i = proto_is_chw ? 1 : 0;
-        constants[6].i = mask_dim;
-        constants[7].i = count;
-        constants[8].i = input_height;
-        constants[9].i = input_width;
-        constants[10].i = orig_height;
-        constants[11].i = orig_width;
+        constants[1].i = recording.proto_unpacked.w;
+        constants[2].i = recording.proto_unpacked.h;
+        constants[3].i = recording.proto_unpacked.c;
+        constants[4].i = proto_is_chw ? 1 : 0;
+        constants[5].i = mask_dim;
+        constants[6].i = count;
+        constants[7].i = input_height;
+        constants[8].i = input_width;
         cmd.record_pipeline(
-            context->yolo_seg_mask_direct_pipeline,
+            context->yolo_seg_mask_proto_decode_pipeline,
+            bindings,
+            constants,
+            recording.proto_logits_blob);
+    }
+
+    {
+        std::vector<ncnn::VkMat> bindings(2);
+        bindings[0] = recording.proto_logits_blob;
+        bindings[1] = recording.input_masks_blob;
+
+        std::vector<ncnn::vk_constant_type> constants(5);
+        constants[0].i = proto_width;
+        constants[1].i = proto_height;
+        constants[2].i = count;
+        constants[3].i = input_height;
+        constants[4].i = input_width;
+        cmd.record_pipeline(
+            context->yolo_seg_mask_input_resize_pipeline,
+            bindings,
+            constants,
+            recording.input_masks_blob);
+    }
+
+    {
+        std::vector<ncnn::VkMat> bindings(2);
+        bindings[0] = recording.input_masks_blob;
+        bindings[1] = recording.masks_blob;
+
+        std::vector<ncnn::vk_constant_type> constants(5);
+        constants[0].i = input_width;
+        constants[1].i = input_height;
+        constants[2].i = count;
+        constants[3].i = orig_height;
+        constants[4].i = orig_width;
+        cmd.record_pipeline(
+            context->yolo_seg_mask_orig_resize_pipeline,
             bindings,
             constants,
             recording.masks_blob);
     }
 
     cmd.record_download(boxes_blob, recording.boxes_mat, opt);
+    cmd.record_download(recording.input_masks_blob, recording.input_masks_mat, opt);
     cmd.record_download(recording.masks_blob, recording.masks_mat, opt);
     return recording;
 }
@@ -1805,6 +2127,16 @@ py::dict pack_yolo_segmentation_masks_gpu_finalize(const YoloSegMaskFinalizeReco
         throw std::runtime_error("Downloaded YOLO boxes tensor has an unexpected shape or dtype.");
     }
     if (
+        !recording.input_masks_mat.empty()
+        && (
+            recording.input_masks_mat.dims != 3
+            || recording.input_masks_mat.w <= 0
+            || recording.input_masks_mat.h <= 0
+            || recording.input_masks_mat.c != recording.count
+            || recording.input_masks_mat.elemsize != sizeof(float))) {
+        throw std::runtime_error("Downloaded YOLO input-space masks tensor has an unexpected shape or dtype.");
+    }
+    if (
         recording.masks_mat.dims != 3
         || recording.masks_mat.w != recording.orig_width
         || recording.masks_mat.h != recording.orig_height
@@ -1813,14 +2145,19 @@ py::dict pack_yolo_segmentation_masks_gpu_finalize(const YoloSegMaskFinalizeReco
         throw std::runtime_error("Downloaded YOLO masks tensor has an unexpected shape or dtype.");
     }
 
+    const std::size_t input_plane_size = static_cast<std::size_t>(recording.input_masks_mat.h)
+        * static_cast<std::size_t>(recording.input_masks_mat.w);
     const std::size_t plane_size = static_cast<std::size_t>(recording.orig_height)
         * static_cast<std::size_t>(recording.orig_width);
     std::vector<int> kept_indices;
     kept_indices.reserve(static_cast<std::size_t>(recording.count));
     for (int det_index = 0; det_index < recording.count; ++det_index) {
-        const float* mask_ptr = static_cast<const float*>(recording.masks_mat.channel(det_index).data);
+        const float* mask_ptr = recording.input_masks_mat.empty()
+            ? static_cast<const float*>(recording.masks_mat.channel(det_index).data)
+            : static_cast<const float*>(recording.input_masks_mat.channel(det_index).data);
+        const std::size_t active_plane_size = recording.input_masks_mat.empty() ? plane_size : input_plane_size;
         bool active = false;
-        for (std::size_t pixel_index = 0; pixel_index < plane_size; ++pixel_index) {
+        for (std::size_t pixel_index = 0; pixel_index < active_plane_size; ++pixel_index) {
             if (mask_ptr[pixel_index] > 127.f) {
                 active = true;
                 break;
@@ -2035,7 +2372,9 @@ py::dict postprocess_yolo_segmentation_py(
     float iou_threshold,
     int max_det,
     int num_classes,
-    bool agnostic_nms)
+    bool agnostic_nms,
+    const std::vector<int>& classes,
+    int max_nms)
 {
     if (pred.ndim() != 2) {
         throw std::runtime_error("YOLO prediction tensor must be 2D.");
@@ -2051,8 +2390,10 @@ py::dict postprocess_yolo_segmentation_py(
     config.conf_threshold = conf_threshold;
     config.iou_threshold = iou_threshold;
     config.max_det = max_det;
+    config.max_nms = max_nms;
     config.num_classes = num_classes;
     config.agnostic_nms = agnostic_nms;
+    config.allowed_classes = normalize_yolo_allowed_classes(num_classes, classes);
     config.input_height = input_shape[0];
     config.input_width = input_shape[1];
     config.orig_height = orig_shape[0];
@@ -2221,6 +2562,8 @@ void bind_lada_local_runtime(py::module_& m)
         py::arg("max_det"),
         py::arg("num_classes"),
         py::arg("agnostic_nms") = false,
+        py::arg("classes") = std::vector<int>(),
+        py::arg("max_nms") = 30000,
         "Run native YOLO segmentation postprocess and return final boxes and masks.");
     m.def(
         "postprocess_yolo_segmentation_from_selected",
@@ -2251,6 +2594,7 @@ void bind_lada_local_runtime(py::module_& m)
 #if NCNN_VULKAN
     py::class_<LadaVulkanTensor>(m, "LadaVulkanTensor")
         .def("download", &LadaVulkanTensor::download)
+        .def("clone", &LadaVulkanTensor::clone)
         .def_property_readonly("dims", &LadaVulkanTensor::dims)
         .def_property_readonly("w", &LadaVulkanTensor::w)
         .def_property_readonly("h", &LadaVulkanTensor::h)
@@ -2271,6 +2615,7 @@ void bind_lada_local_runtime(py::module_& m)
             &LadaVulkanNetRunner::preprocess_bgr_u8_batch,
             py::arg("images"),
             py::arg("input_shape"))
+        .def("upload_cpu_mat", &LadaVulkanNetRunner::upload_cpu_mat, py::arg("mat"))
         .def("run", &LadaVulkanNetRunner::run, py::arg("inputs"), py::arg("output_name") = "out0")
         .def("run_many", &LadaVulkanNetRunner::run_many, py::arg("inputs"), py::arg("output_names"))
         .def("run_to_cpu", &LadaVulkanNetRunner::run_to_cpu, py::arg("inputs"), py::arg("output_name") = "out0")
@@ -2290,7 +2635,9 @@ void bind_lada_local_runtime(py::module_& m)
             py::arg("iou_threshold"),
             py::arg("max_det"),
             py::arg("num_classes"),
-            py::arg("agnostic_nms") = false)
+            py::arg("agnostic_nms") = false,
+            py::arg("classes") = std::vector<int>(),
+            py::arg("max_nms") = 30000)
         .def(
             "run_yolo_segmentation_subnet",
             &LadaVulkanNetRunner::run_yolo_segmentation_subnet,
@@ -2303,7 +2650,9 @@ void bind_lada_local_runtime(py::module_& m)
             py::arg("iou_threshold"),
             py::arg("max_det"),
             py::arg("num_classes"),
-            py::arg("agnostic_nms") = false)
+            py::arg("agnostic_nms") = false,
+            py::arg("classes") = std::vector<int>(),
+            py::arg("max_nms") = 30000)
         .def(
             "run_yolo_segmentation_subnet_batch",
             &LadaVulkanNetRunner::run_yolo_segmentation_subnet_batch,
@@ -2317,7 +2666,9 @@ void bind_lada_local_runtime(py::module_& m)
             py::arg("iou_threshold"),
             py::arg("max_det"),
             py::arg("num_classes"),
-            py::arg("agnostic_nms") = false);
+            py::arg("agnostic_nms") = false,
+            py::arg("classes") = std::vector<int>(),
+            py::arg("max_nms") = 30000);
 
     m.attr("has_lada_vulkan_net_runner") = py::bool_(true);
 #else

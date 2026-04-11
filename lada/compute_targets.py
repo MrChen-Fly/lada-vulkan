@@ -1,12 +1,12 @@
 from __future__ import annotations
-
-import ctypes
-import ctypes.util
-import sys
 from dataclasses import dataclass
 
 import torch
 
+from lada.extensions.runtime_registry import (
+    get_runtime_extension,
+    iter_runtime_extensions,
+)
 from lada.utils.os_utils import gpu_has_fp16_acceleration, has_mps
 
 
@@ -23,46 +23,6 @@ class ComputeTarget:
 
 class UnsupportedComputeTargetError(RuntimeError):
     """Raised when a requested compute target cannot back the current pipeline."""
-
-
-def _has_vulkan_loader() -> bool:
-    probe_name = "vulkan-1" if sys.platform == "win32" else "vulkan"
-    if ctypes.util.find_library(probe_name) is not None:
-        return True
-
-    load_name = "vulkan-1.dll" if sys.platform == "win32" else "libvulkan.so.1"
-    loader = ctypes.WinDLL if sys.platform == "win32" else ctypes.CDLL
-    try:
-        loader(load_name)
-        return True
-    except OSError:
-        return False
-
-
-def _has_ncnn_vulkan_runtime() -> bool:
-    try:
-        from lada.models.basicvsrpp.ncnn_vulkan import (
-            import_ncnn_module,
-            ncnn_has_lada_basicvsrpp_clip_runner,
-            ncnn_has_lada_custom_layer,
-            ncnn_has_lada_gridsample_layer,
-            ncnn_has_lada_vulkan_net_runner,
-            ncnn_has_lada_yolo_attention_layer,
-            ncnn_has_lada_yolo_seg_postprocess_vulkan_layer,
-        )
-
-        ncnn = import_ncnn_module()
-        return (
-            ncnn.get_gpu_count() > 0
-            and ncnn_has_lada_custom_layer(ncnn)
-            and ncnn_has_lada_gridsample_layer(ncnn)
-            and ncnn_has_lada_yolo_attention_layer(ncnn)
-            and ncnn_has_lada_yolo_seg_postprocess_vulkan_layer(ncnn)
-            and ncnn_has_lada_vulkan_net_runner(ncnn)
-            and ncnn_has_lada_basicvsrpp_clip_runner(ncnn)
-        )
-    except Exception:
-        return False
 
 
 def normalize_compute_target_id(target_id: str | None) -> str:
@@ -130,34 +90,13 @@ def get_compute_targets(include_experimental: bool = False) -> list[ComputeTarge
                 )
             )
 
-    if include_experimental:
-        has_loader = _has_vulkan_loader()
-        has_ncnn_runtime = _has_ncnn_vulkan_runtime()
-        loader_note = "" if has_loader else " Vulkan loader not detected on this machine."
-        ncnn_note = (
-            ""
-            if has_ncnn_runtime
-            else (
-                " Build the local ncnn Vulkan runtime with Lada custom operators "
-                "(for example via 'scripts/build_ncnn_vulkan_runtime.ps1')."
-            )
-        )
-        targets.append(
-            ComputeTarget(
-                id="vulkan:0",
-                description="Vulkan",
-                runtime="vulkan",
-                available=has_loader and has_ncnn_runtime,
-                torch_device=None,
-                notes=(
-                    "Vulkan backend backed by the local ncnn runtime and Lada custom operators. "
-                    "Mosaic detection runs through fused YOLO segmentation postprocess on GPU, and "
-                    "BasicVSR++ restoration runs through the modular 5-frame / recurrent Vulkan graph. "
-                    f"DeepMosaics is not supported.{loader_note}{ncnn_note}"
-                ),
-                experimental=True,
-            )
-        )
+    for extension in iter_runtime_extensions():
+        get_targets = extension.get_compute_targets
+        if get_targets is None:
+            continue
+        for target in get_targets():
+            if include_experimental or not getattr(target, "experimental", False):
+                targets.append(target)
 
     return targets
 
@@ -211,10 +150,27 @@ def default_fp16_enabled_for_compute_target(target_id: str | None) -> bool:
     target = get_compute_target(normalized_target_id, include_experimental=True)
     if target is None:
         return gpu_has_fp16_acceleration()
-    if target.runtime == "vulkan":
-        # The local NCNN Vulkan path is designed around fp16 artifacts; callers can still opt out
-        # with `--no-fp16` when they need conservative compatibility.
-        return True
+    extension = get_runtime_extension(target.runtime)
+    if extension is not None and extension.default_fp16_enabled is not None:
+        return bool(extension.default_fp16_enabled(normalized_target_id))
     if target.torch_device is None:
         return False
     return gpu_has_fp16_acceleration(torch.device(target.torch_device))
+
+
+def configure_compute_target_device_info(
+    target_id: str | None,
+    *,
+    show: bool | None = None,
+) -> bool | None:
+    """Allow runtime extensions to configure optional one-time device info logging."""
+    normalized_target_id = normalize_compute_target_id(target_id)
+    runtime_hint = normalized_target_id.split(":", 1)[0]
+    extension = get_runtime_extension(runtime_hint)
+    if extension is None:
+        target = get_compute_target(normalized_target_id, include_experimental=True)
+        runtime = target.runtime if target is not None else runtime_hint
+        extension = get_runtime_extension(runtime)
+    if extension is None or extension.configure_device_info is None:
+        return None
+    return extension.configure_device_info(show)

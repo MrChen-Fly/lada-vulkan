@@ -1,81 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
+from lada.extensions.vulkan import basicvsrpp_artifacts as _impl
 
-from lada.compute_targets import UnsupportedComputeTargetError
-from lada.models.basicvsrpp.ncnn_vulkan import (
-    ncnn_has_lada_custom_layer,
-    ncnn_has_lada_gridsample_layer,
+globals().update(
+    {
+        name: getattr(_impl, name)
+        for name in dir(_impl)
+        if not name.startswith("__")
+    }
 )
-
-from .basicvsrpp_vulkan_common import (
-    NcnnArtifacts,
-    _MODULAR_FRAME_COUNT,
-    _delete_ncnn_artifact_group,
-    _import_ncnn,
-    _prune_extra_ncnn_artifact_files,
-    _resolve_ncnn_basicvsrpp_modular_artifacts,
-    _validate_ncnn_artifact_group,
-)
-from .basicvsrpp_vulkan_export import (
-    _build_modular_export_specs,
-    _enable_basicvsrpp_export_mode,
-    _export_ncnn_module,
-)
-
-
-def ensure_ncnn_basicvsrpp_modular_artifacts(
-    checkpoint_path: str,
-    *,
-    config_path: str | dict | None = None,
-    frame_count: int = _MODULAR_FRAME_COUNT,
-    artifacts_dir: str | Path | None = None,
-) -> dict[str, NcnnArtifacts]:
-    """Build cached ncnn artifacts for the modular 5-frame Vulkan BasicVSR++ runtime."""
-    if frame_count != _MODULAR_FRAME_COUNT:
-        raise UnsupportedComputeTargetError(
-            f"Modular Vulkan BasicVSR++ currently supports frame_count={_MODULAR_FRAME_COUNT} only."
-        )
-
-    ncnn_module = _import_ncnn()
-    if not ncnn_has_lada_custom_layer(ncnn_module):
-        raise UnsupportedComputeTargetError(
-            "Vulkan BasicVSR++ requires the local ncnn runtime with the Lada deform-conv custom layer."
-        )
-    if not ncnn_has_lada_gridsample_layer(ncnn_module):
-        raise UnsupportedComputeTargetError(
-            "Vulkan BasicVSR++ requires the local ncnn runtime with the Lada GridSample custom layer."
-        )
-    enable_lada_gridsample = True
-    artifacts_by_name = _resolve_ncnn_basicvsrpp_modular_artifacts(
-        checkpoint_path,
-        frame_count=frame_count,
-        artifacts_dir=artifacts_dir,
-    )
-    _prune_extra_ncnn_artifact_files(artifacts_by_name)
-    if all(
-        artifacts.param_path.exists() and artifacts.bin_path.exists()
-        for artifacts in artifacts_by_name.values()
-    ):
-        try:
-            _validate_ncnn_artifact_group(
-                artifacts_by_name,
-                enable_lada_gridsample=enable_lada_gridsample,
-            )
-            return artifacts_by_name
-        except UnsupportedComputeTargetError:
-            _delete_ncnn_artifact_group(artifacts_by_name)
-
-    from lada.models.basicvsrpp.inference import load_model
-
-    model = load_model(config_path, checkpoint_path, "cpu", fp16=False)
-    _enable_basicvsrpp_export_mode(model)
-
-    for spec in _build_modular_export_specs(model):
-        _export_ncnn_module(spec, artifacts_by_name[spec.name])
-
-    _validate_ncnn_artifact_group(
-        artifacts_by_name,
-        enable_lada_gridsample=enable_lada_gridsample,
-    )
-    return artifacts_by_name

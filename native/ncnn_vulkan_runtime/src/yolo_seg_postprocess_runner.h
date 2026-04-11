@@ -14,8 +14,10 @@ struct YoloSegPostprocessConfig
     float conf_threshold = 0.25f;
     float iou_threshold = 0.45f;
     int max_det = 300;
+    int max_nms = 30000;
     int num_classes = 1;
     bool agnostic_nms = false;
+    std::vector<unsigned char> allowed_classes;
     int input_height = 0;
     int input_width = 0;
     int orig_height = 0;

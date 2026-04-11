@@ -9,11 +9,11 @@ import subprocess
 import sys
 import time
 
+import torch
 from tqdm import tqdm
 from wcwidth import wcswidth
 
 from lada import ModelFiles
-from lada.compute_targets import get_compute_targets
 from lada.utils import VideoMetadata, video_utils
 
 COL_SEP = "  "
@@ -21,45 +21,26 @@ COL_SEP = "  "
 def wcrjust(text, length, padding=' '):
     return text + padding * max(0, (length - wcswidth(text)))
 
-def is_video_path(file_path: str) -> bool:
-    if not os.path.isfile(file_path):
-        return False
-
-    if sys.version_info >= (3, 13):
-        mime_type, _ = mimetypes.guess_file_type(file_path)
-    else:
-        mime_type, _ = mimetypes.guess_type(file_path)
-    if not mime_type:
-        return False
-    return mime_type.lower().startswith("video/")
-
-
-def list_video_files(directory_path: str, recursive: bool = False) -> list[str]:
-    video_files: list[str] = []
-    root = pathlib.Path(directory_path)
-    iterator = root.rglob("*") if recursive else root.iterdir()
-    for path in iterator:
-        if not is_video_path(str(path)):
+def _filter_video_files(directory_path: str):
+    video_files = []
+    for name in os.listdir(directory_path):
+        path = os.path.join(directory_path, name)
+        if not os.path.isfile(path):
             continue
-        video_files.append(str(path))
-    return sorted(video_files)
+        if sys.version_info >= (3, 13):
+            mime_type, _ = mimetypes.guess_file_type(path)
+        else:
+            mime_type, _ = mimetypes.guess_type(path)
+        if not mime_type:
+            continue
+        if not mime_type.lower().startswith("video/"):
+            continue
+        video_files.append(path)
+    return video_files
 
-
-def build_output_file_path(
-    input_file_path: str,
-    output_directory: str,
-    output_file_pattern: str,
-    input_root_directory: str | None = None,
-    preserve_relative_paths: bool = False,
-) -> str:
+def _get_output_file_path(input_file_path: str, output_directory: str, output_file_pattern: str):
     output_file_name = output_file_pattern.replace("{orig_file_name}", pathlib.Path(input_file_path).stem)
-    if not preserve_relative_paths or input_root_directory is None:
-        return os.path.join(output_directory, output_file_name)
-
-    relative_parent = pathlib.Path(os.path.relpath(pathlib.Path(input_file_path).parent, input_root_directory))
-    if str(relative_parent) == ".":
-        return os.path.join(output_directory, output_file_name)
-    return os.path.join(output_directory, str(relative_parent), output_file_name)
+    return os.path.join(output_directory, output_file_name)
 
 def setup_input_and_output_paths(input_arg, output_arg, output_file_pattern):
     single_file_input = os.path.isfile(input_arg)
@@ -67,7 +48,7 @@ def setup_input_and_output_paths(input_arg, output_arg, output_file_pattern):
     if single_file_input:
         input_files = [os.path.abspath(input_arg)]
     else:
-        input_files = list_video_files(input_arg)
+        input_files = _filter_video_files(input_arg)
 
     if len(input_files) == 0:
         print(_("No video files found"))
@@ -77,10 +58,10 @@ def setup_input_and_output_paths(input_arg, output_arg, output_file_pattern):
         if not output_arg:
             input_file_path = input_files[0]
             output_dir_path = str(pathlib.Path(input_file_path).parent)
-            output_files = [build_output_file_path(input_file_path, output_dir_path, output_file_pattern)]
+            output_files = [_get_output_file_path(input_file_path, output_dir_path, output_file_pattern)]
         elif os.path.isdir(output_arg):
             input_file_path = input_files[0]
-            output_files = [build_output_file_path(input_file_path, output_arg, output_file_pattern)]
+            output_files = [_get_output_file_path(input_file_path, output_arg, output_file_pattern)]
         else:
             output_files = [output_arg]
     else:
@@ -90,7 +71,7 @@ def setup_input_and_output_paths(input_arg, output_arg, output_file_pattern):
             output_dir_path = output_arg
         else:
             output_dir_path = str(pathlib.Path(input_files[0]).parent)
-        output_files = [build_output_file_path(input_file_path, output_dir_path, output_file_pattern) for input_file_path in input_files]
+        output_files = [_get_output_file_path(input_file_path, output_dir_path, output_file_pattern) for input_file_path in input_files]
 
     assert len(input_files) == len(output_files)
 
@@ -127,12 +108,31 @@ def dump_encoders():
     _dump_table(table)
 
 def dump_torch_devices():
+    from lada.utils.os_utils import has_mps
+
     print(_("Available devices:"))
-    table = [[_("Device"), _("Description"), _("Status"), _("Notes")]]
-    for target in get_compute_targets(include_experimental=True):
-        status = _("Available") if target.available else _("Unavailable")
-        notes = target.notes if target.notes else (_("Experimental") if target.experimental else "")
-        table.append([target.id, target.description, status, notes])
+    devices = ["cpu"]
+    descriptions = ["CPU"]
+
+    if torch.cuda.is_available():
+        cuda_device_count = torch.cuda.device_count()
+        for i in range(cuda_device_count):
+            devices.append(f"cuda:{i}")
+            descriptions.append(torch.cuda.get_device_properties(i).name)
+
+    if has_mps():
+        devices.append("mps")
+        descriptions.append("Apple MPS (Metal)")
+
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        xpu_device_count = torch.xpu.device_count()
+        for i in range(xpu_device_count):
+            devices.append(f"xpu:{i}")
+            descriptions.append(torch.xpu.get_device_name(i))
+
+    table = [[_("Device"), _("Description")]]
+    for device, description in zip(devices, descriptions):
+        table.append([device, description])
     _dump_table(table)
 
 def dump_available_detection_models():
@@ -186,9 +186,8 @@ class Progressbar:
     def __init__(self, video_metadata: VideoMetadata):
         self.frame_processing_durations_buffer = []
         self.video_metadata = video_metadata
-        processed_frame_budget = max(video_metadata.frames_count - 1, 0)
-        self.frame_processing_durations_buffer_min_len = min(processed_frame_budget, int(video_metadata.video_fps * 15))
-        self.frame_processing_durations_buffer_max_len = min(processed_frame_budget, int(video_metadata.video_fps * 120))
+        self.frame_processing_durations_buffer_min_len = min(video_metadata.frames_count - 1, int(video_metadata.video_fps * 15))
+        self.frame_processing_durations_buffer_max_len = min(video_metadata.frames_count - 1, int(video_metadata.video_fps * 120))
         self.error = False
 
         # Use {unit} instead of {postfix} as tqdm will add an additional comma without a way to overwrite this behavior (https://github.com/tqdm/tqdm/issues/712)
@@ -216,10 +215,7 @@ class Progressbar:
         duration = duration_end - self.duration_start
         self.duration_start = duration_end
 
-        if (
-            self.frame_processing_durations_buffer_max_len > 0 and
-            len(self.frame_processing_durations_buffer) >= self.frame_processing_durations_buffer_max_len
-        ):
+        if len(self.frame_processing_durations_buffer) >= self.frame_processing_durations_buffer_max_len:
             self.frame_processing_durations_buffer.pop(0)
         self.frame_processing_durations_buffer.append(duration)
 

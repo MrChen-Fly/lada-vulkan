@@ -240,7 +240,7 @@ def main() -> None:
         else torch.device("cpu")
     )
 
-    detection_model, restoration_model, preferred_pad_mode = load_models(
+    loaded_models = load_models(
         compute_target_id,
         torch_device,
         "basicvsrpp-v1.2",
@@ -250,6 +250,9 @@ def main() -> None:
         args.fp16,
         False,
     )
+    detection_model = loaded_models.detection_model
+    restoration_model = loaded_models.restoration_model
+    preferred_pad_mode = loaded_models.preferred_pad_mode
     if not isinstance(restoration_model, NcnnVulkanBasicvsrppMosaicRestorer):
         raise RuntimeError("This benchmark requires the Vulkan BasicVSR++ restorer.")
     if restoration_model.native_clip_runner is None:

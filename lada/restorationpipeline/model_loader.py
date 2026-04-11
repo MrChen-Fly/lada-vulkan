@@ -24,6 +24,7 @@ class LoadedModels:
     detection_model: MosaicDetectionModel
     restoration_model: MosaicRestorationModel
     preferred_pad_mode: str
+    frame_device: torch.device
 
 
 def _resolve_detection_classes(
@@ -51,7 +52,7 @@ def _resolve_detection_classes(
 
 def load_models(
     compute_target_id: str,
-    device: torch.device | None,
+    torch_device: torch.device | None,
     mosaic_restoration_model_name: str,
     mosaic_restoration_model_path: str,
     mosaic_restoration_config_path: str | None,
@@ -65,7 +66,7 @@ def load_models(
         mosaic_restoration_model_path,
         mosaic_restoration_config_path,
         compute_target_id,
-        device,
+        torch_device,
         fp16=fp16,
     )
     detection_model = build_mosaic_detection_model(
@@ -82,4 +83,5 @@ def load_models(
         detection_model=detection_model,
         restoration_model=restoration_model,
         preferred_pad_mode=preferred_pad_mode,
+        frame_device=torch_device if torch_device is not None else torch.device("cpu"),
     )

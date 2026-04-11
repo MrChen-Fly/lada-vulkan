@@ -25,8 +25,10 @@ struct RuntimeConfig
     float conf_threshold = 0.25f;
     float iou_threshold = 0.45f;
     int max_det = 300;
+    int max_nms = 30000;
     int num_classes = 1;
     bool agnostic_nms = false;
+    std::vector<unsigned char> allowed_classes;
     int input_height = 0;
     int input_width = 0;
     int orig_height = 0;
@@ -44,8 +46,8 @@ struct TensorLayout
 
 RuntimeConfig parse_runtime_config(const ncnn::Mat& config_blob)
 {
-    if (config_blob.dims != 1 || config_blob.w < 9) {
-        throw std::runtime_error("YOLO segmentation config tensor must be a 1D tensor with 9 values.");
+    if (config_blob.dims != 1 || config_blob.w < 10) {
+        throw std::runtime_error("YOLO segmentation config tensor must be a 1D tensor with 10 values.");
     }
     if (config_blob.elempack != 1 || config_blob.elemsize != sizeof(float)) {
         throw std::runtime_error("YOLO segmentation config tensor must be unpacked float32.");
@@ -56,12 +58,20 @@ RuntimeConfig parse_runtime_config(const ncnn::Mat& config_blob)
     config.conf_threshold = values[0];
     config.iou_threshold = values[1];
     config.max_det = std::max(static_cast<int>(values[2]), 0);
-    config.num_classes = std::max(static_cast<int>(values[3]), 1);
-    config.agnostic_nms = values[4] != 0.f;
-    config.input_height = std::max(static_cast<int>(values[5]), 0);
-    config.input_width = std::max(static_cast<int>(values[6]), 0);
-    config.orig_height = std::max(static_cast<int>(values[7]), 0);
-    config.orig_width = std::max(static_cast<int>(values[8]), 0);
+    config.max_nms = std::max(static_cast<int>(values[3]), 0);
+    config.num_classes = std::max(static_cast<int>(values[4]), 1);
+    config.agnostic_nms = values[5] != 0.f;
+    config.input_height = std::max(static_cast<int>(values[6]), 0);
+    config.input_width = std::max(static_cast<int>(values[7]), 0);
+    config.orig_height = std::max(static_cast<int>(values[8]), 0);
+    config.orig_width = std::max(static_cast<int>(values[9]), 0);
+    if (config_blob.w >= 10 + config.num_classes) {
+        config.allowed_classes.resize(static_cast<std::size_t>(config.num_classes), 0);
+        for (int class_index = 0; class_index < config.num_classes; ++class_index) {
+            config.allowed_classes[static_cast<std::size_t>(class_index)] =
+                values[10 + class_index] != 0.f ? static_cast<unsigned char>(1) : static_cast<unsigned char>(0);
+        }
+    }
     return config;
 }
 
@@ -152,6 +162,7 @@ layout(push_constant) uniform parameter
 {
     int pred_dim0;
     int pred_dim1;
+    int config_w;
     int pred_features_first;
     int num_boxes;
     int num_classes;
@@ -171,6 +182,15 @@ float pred_value_at(int feature_index, int box_index)
 float config_value_at(int index)
 {
     return float(buffer_ld1(config_blob_data, index));
+}
+
+bool class_is_allowed(int class_index)
+{
+    if (class_index < 0 || class_index >= p.num_classes)
+        return false;
+    if (p.config_w < 10 + p.num_classes)
+        return true;
+    return config_value_at(10 + class_index) != 0.0;
 }
 
 void decoded_store(int box_index, int feature_index, float value)
@@ -197,7 +217,7 @@ void main()
     }
 
     const float conf_threshold = config_value_at(0);
-    if (best_confidence <= conf_threshold)
+    if (best_confidence <= conf_threshold || !class_is_allowed(best_class))
     {
         for (int feature_index = 0; feature_index < p.candidate_feature_dim; feature_index++)
         {
@@ -275,6 +295,34 @@ void suppressed_store(int index, float value)
     buffer_st1(suppressed_blob_data, index, afp(value));
 }
 
+bool candidate_in_max_nms(int box_index, float conf_threshold, int max_nms)
+{
+    if (max_nms <= 0)
+        return false;
+
+    const float confidence = decoded_value_at(box_index, 4);
+    if (confidence <= conf_threshold)
+        return false;
+
+    int higher_rank_count = 0;
+    for (int other_index = 0; other_index < p.num_boxes; other_index++)
+    {
+        if (other_index == box_index)
+            continue;
+
+        const float other_confidence = decoded_value_at(other_index, 4);
+        if (other_confidence <= conf_threshold)
+            continue;
+        if (other_confidence > confidence || (other_confidence == confidence && other_index < box_index))
+        {
+            higher_rank_count += 1;
+            if (higher_rank_count >= max_nms)
+                return false;
+        }
+    }
+    return true;
+}
+
 float intersection_over_union(int left_index, int right_index)
 {
     const float left_x1 = decoded_value_at(left_index, 0);
@@ -311,15 +359,16 @@ void main()
 
     const float conf_threshold = config_value_at(0);
     const float iou_threshold = config_value_at(1);
-    const bool agnostic_nms = config_value_at(4) != 0.0;
-    const float input_height = config_value_at(5);
-    const float input_width = config_value_at(6);
-    const float orig_height = config_value_at(7);
-    const float orig_width = config_value_at(8);
+    const int max_nms = max(int(config_value_at(3)), 0);
+    const bool agnostic_nms = config_value_at(5) != 0.0;
+    const float input_height = config_value_at(6);
+    const float input_width = config_value_at(7);
+    const float orig_height = config_value_at(8);
+    const float orig_width = config_value_at(9);
 
     for (int box_index = 0; box_index < p.num_boxes; box_index++)
     {
-        suppressed_store(box_index, 0.0);
+        suppressed_store(box_index, candidate_in_max_nms(box_index, conf_threshold, max_nms) ? 0.0 : 1.0);
     }
     for (int row = 0; row < p.output_capacity; row++)
     {
@@ -496,7 +545,7 @@ int LadaYoloSegPostprocessLayer::forward(
 {
     (void)opt;
 
-    if (bottom_blobs.size() != 3) {
+        if (bottom_blobs.size() != 3) {
         return -100;
     }
 
@@ -510,13 +559,19 @@ int LadaYoloSegPostprocessLayer::forward(
         RuntimeConfig runtime_config = parse_runtime_config(config_blob);
         runtime_config.max_det = max_det;
         runtime_config.num_classes = num_classes;
+        if (!runtime_config.allowed_classes.empty()
+            && runtime_config.allowed_classes.size() != static_cast<std::size_t>(runtime_config.num_classes)) {
+            runtime_config.allowed_classes.clear();
+        }
 
         YoloSegPostprocessConfig config;
         config.conf_threshold = runtime_config.conf_threshold;
         config.iou_threshold = runtime_config.iou_threshold;
         config.max_det = runtime_config.max_det;
+        config.max_nms = runtime_config.max_nms;
         config.num_classes = runtime_config.num_classes;
         config.agnostic_nms = runtime_config.agnostic_nms;
+        config.allowed_classes = runtime_config.allowed_classes;
         config.input_height = runtime_config.input_height;
         config.input_width = runtime_config.input_width;
         config.orig_height = runtime_config.orig_height;
@@ -609,14 +664,15 @@ int LadaYoloSegPostprocessLayer::forward(
         bindings[1] = config_blob;
         bindings[2] = decoded_candidates;
 
-        std::vector<ncnn::vk_constant_type> constants(7);
+        std::vector<ncnn::vk_constant_type> constants(8);
         constants[0].i = pred.h;
         constants[1].i = pred.w;
-        constants[2].i = layout.pred_features_first ? 1 : 0;
-        constants[3].i = layout.num_boxes;
-        constants[4].i = num_classes;
-        constants[5].i = layout.mask_dim;
-        constants[6].i = layout.candidate_feature_dim;
+        constants[2].i = config_blob.w;
+        constants[3].i = layout.pred_features_first ? 1 : 0;
+        constants[4].i = layout.num_boxes;
+        constants[5].i = num_classes;
+        constants[6].i = layout.mask_dim;
+        constants[7].i = layout.candidate_feature_dim;
         // Dispatch decode over the candidate axis only; the storage tensor stays row-major
         // as [num_boxes, candidate_feature_dim] for the downstream select shader.
         cmd.record_pipeline(pipeline_candidate_decode, bindings, constants, suppressed_flags);

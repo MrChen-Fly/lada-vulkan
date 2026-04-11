@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from .frame_restorer import FrameRestorer
 
 
+def _resolve_descriptor_resize_mode(restorer: "FrameRestorer") -> str:
+    return str(getattr(restorer.mosaic_restoration_model, "descriptor_resize_mode", "opencv"))
+
+
 def _snapshot_restored_frame(frame: Image | ImageTensor) -> Image | ImageTensor:
     """Detach restored frame storage from reusable runtime buffers."""
     if isinstance(frame, torch.Tensor):
@@ -57,8 +61,13 @@ def materialize_clip_work_item(
     if isinstance(clip, Clip):
         return clip
     profile: dict[str, float] = {}
+    resize_mode = _resolve_descriptor_resize_mode(restorer)
     with restorer.profiler.measure("clip_preprocess_s"):
-        materialized = Clip.from_descriptor_with_profile(clip, profile)
+        materialized = Clip.from_descriptor_with_profile(
+            clip,
+            profile,
+            resize_mode=resize_mode,
+        )
     for bucket, duration in profile.items():
         restorer.profiler.add_duration(bucket, duration)
     return materialized
