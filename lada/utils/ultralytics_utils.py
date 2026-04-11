@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 import os.path
 from pathlib import Path
-from typing import TypeAlias
 
 import cv2
 import numpy as np
@@ -16,8 +15,6 @@ from ultralytics.utils import JSONDict
 
 from lada.utils import Box, Mask
 
-DetectionResult: TypeAlias = UltralyticsResults
-
 def set_default_settings():
     settings.update(dict(
         runs_dir=os.path.join('.', 'experiments', 'yolo'),
@@ -28,31 +25,6 @@ def set_default_settings():
 
 def get_settings() -> JSONDict:
     return settings
-
-
-def build_native_yolo_result(
-    *,
-    orig_img,
-    names: dict[int, str],
-    boxes: np.ndarray,
-    masks: np.ndarray,
-) -> UltralyticsResults:
-    box_tensor = torch.from_numpy(
-        np.ascontiguousarray(boxes, dtype=np.float32).reshape(-1, 6)
-    )
-    mask_tensor = None
-    mask_array = np.ascontiguousarray(masks, dtype=np.uint8)
-    if mask_array.size > 0:
-        if mask_array.ndim == 2:
-            mask_array = mask_array[None, ...]
-        mask_tensor = torch.from_numpy(mask_array)
-    return UltralyticsResults(
-        orig_img,
-        path="",
-        names=names,
-        boxes=box_tensor,
-        masks=mask_tensor,
-    )
 
 def convert_yolo_box(yolo_box: UltralyticsBoxes, img_shape) -> Box:
     _box = yolo_box.xyxy[0]

@@ -6,7 +6,7 @@ import torch
 
 from lada.parity import _run_detection_parity
 from lada.parity_report import build_probe
-from lada.utils.ultralytics_utils import build_native_yolo_result
+from lada.models.yolo.runtime_results import build_native_yolo_result
 
 
 class BuildProbeTests(unittest.TestCase):

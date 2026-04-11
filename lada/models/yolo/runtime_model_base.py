@@ -20,7 +20,7 @@ from ultralytics.utils.checks import check_imgsz
 
 from lada.utils import Image, ImageTensor
 from lada.utils.torch_letterbox import PyTorchLetterBox
-from lada.utils.ultralytics_utils import DetectionResult
+from lada.models.yolo.runtime_results import DetectionResult
 
 
 class BaseYolo11SegmentationModel:

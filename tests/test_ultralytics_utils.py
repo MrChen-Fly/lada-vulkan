@@ -3,8 +3,8 @@ import unittest
 import numpy as np
 from ultralytics.engine.results import Results
 
+from lada.models.yolo.runtime_results import build_native_yolo_result
 from lada.utils.ultralytics_utils import (
-    build_native_yolo_result,
     convert_yolo_box,
     convert_yolo_boxes,
 )

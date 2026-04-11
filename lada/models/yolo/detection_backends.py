@@ -11,8 +11,8 @@ from lada.compute_targets import (
     normalize_compute_target_id,
 )
 from lada.extensions.runtime_registry import get_runtime_extension
+from lada.models.yolo.runtime_results import DetectionResult
 from lada.utils import Image, ImageTensor
-from lada.utils.ultralytics_utils import DetectionResult
 
 
 class _TorchDetectionModelAdapter:

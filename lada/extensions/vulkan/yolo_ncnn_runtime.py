@@ -28,8 +28,11 @@ from lada.extensions.vulkan.yolo_runtime_support import (
     resolve_letterbox_output_shape,
 )
 from lada.models.yolo.runtime_model_base import BaseYolo11SegmentationModel
+from lada.models.yolo.runtime_results import (
+    DetectionResult,
+    build_native_yolo_result,
+)
 from lada.utils import Image, ImageTensor
-from lada.utils.ultralytics_utils import DetectionResult, build_native_yolo_result
 
 logger = logging.getLogger(__name__)
 
