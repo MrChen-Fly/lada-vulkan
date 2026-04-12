@@ -108,6 +108,7 @@ def dump_encoders():
     _dump_table(table)
 
 def dump_torch_devices():
+    from lada.extensions import vulkan  # noqa: F401
     from lada.utils.os_utils import has_mps
 
     print(_("Available devices:"))
@@ -129,6 +130,10 @@ def dump_torch_devices():
         for i in range(xpu_device_count):
             devices.append(f"xpu:{i}")
             descriptions.append(torch.xpu.get_device_name(i))
+
+    if torch.vulkan.is_available():
+        devices.append("vulkan:0")
+        descriptions.append(torch.vulkan.get_device_name(0))
 
     table = [[_("Device"), _("Description")]]
     for device, description in zip(devices, descriptions):

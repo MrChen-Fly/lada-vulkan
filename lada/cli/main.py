@@ -37,6 +37,7 @@ except ModuleNotFoundError:
 
 from lada import VERSION, ModelFiles
 from lada.cli import utils
+from lada.extensions import vulkan
 from lada.utils import audio_utils, video_utils
 from lada.utils.os_utils import gpu_has_fp16_acceleration, get_default_torch_device
 from lada.restorationpipeline.frame_restorer import FrameRestorer
@@ -178,6 +179,9 @@ def main():
     if args.help or not args.input:
         argparser.print_help()
         sys.exit(0)
+    if args.device.startswith("vulkan") and not torch.vulkan.is_available():
+        print(_("GPU {device} selected but Vulkan is not available").format(device=args.device))
+        sys.exit(1)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print(_("GPU {device} selected but CUDA is not available").format(device=args.device))
         sys.exit(1)
