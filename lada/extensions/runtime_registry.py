@@ -33,9 +33,9 @@ def _bootstrap_runtime_extensions() -> None:
     if _BOOTSTRAPPED:
         return
 
-    from .vulkan import register_extension
+    from .iree import register_extension as register_iree_extension
 
-    register_extension()
+    register_iree_extension()
     _BOOTSTRAPPED = True
 
 
