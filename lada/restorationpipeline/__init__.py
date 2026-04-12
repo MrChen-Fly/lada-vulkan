@@ -16,6 +16,18 @@ def load_models(
     mosaic_detection_model_path: str,
     fp16: bool,
     detect_face_mosaics: bool):
+    if str(device).startswith("vulkan"):
+        from lada.extensions.iree.pipeline import load_vulkan_models
+
+        return load_vulkan_models(
+            mosaic_restoration_model_name=mosaic_restoration_model_name,
+            mosaic_restoration_model_path=mosaic_restoration_model_path,
+            mosaic_restoration_config_path=mosaic_restoration_config_path,
+            mosaic_detection_model_path=mosaic_detection_model_path,
+            fp16=fp16,
+            detect_face_mosaics=detect_face_mosaics,
+        )
+
     if mosaic_restoration_model_name.startswith("deepmosaics"):
         from lada.models.deepmosaics.models import loadmodel
         from lada.restorationpipeline.deepmosaics_mosaic_restorer import DeepmosaicsMosaicRestorer
