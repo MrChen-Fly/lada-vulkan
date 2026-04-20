@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
-ComputeTargetProvider = Callable[[], list[Any]]
-DetectionModelBuilder = Callable[..., Any]
-RestorationModelBuilder = Callable[..., tuple[Any, str]]
+
+@dataclass(frozen=True)
+class ComputeTarget:
+    id: str
+    description: str
+    runtime: str
+    available: bool
+    torch_device: str | None
+    notes: str = ""
+    experimental: bool = False
+
+
+class UnsupportedComputeTargetError(RuntimeError):
+    """Raised when a requested compute target cannot back the current pipeline."""
+
+
+ComputeTargetProvider = Callable[[], list[ComputeTarget]]
+DetectionModelBuilder = Callable[..., object]
+RestorationModelBuilder = Callable[..., tuple[object, str]]
 DefaultFp16Resolver = Callable[[str], bool]
 RuntimeDeviceInfoConfigurer = Callable[[bool | None], bool | None]
 
@@ -33,9 +49,9 @@ def _bootstrap_runtime_extensions() -> None:
     if _BOOTSTRAPPED:
         return
 
-    from .iree import register_extension as register_iree_extension
+    from .vulkan import register_extension
 
-    register_iree_extension()
+    register_extension()
     _BOOTSTRAPPED = True
 
 

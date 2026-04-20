@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 
 from lada import LOG_LEVEL, ModelFiles
+from lada.extensions.vulkan.frame_restorer import build_vulkan_frame_restorer
+from lada.extensions.vulkan.runtime import is_vulkan_device
 from lada.utils import VideoMetadata
 
 logger = logging.getLogger(__name__)
@@ -137,6 +139,18 @@ class FrameRestorerProvider:
                                      mosaic_restoration_model=mosaic_restoration_model,
                                      mosaic_restoration_model_preferred_pad_mode=mosaic_restoration_model_preferred_pad_mode,
                                      detect_face_mosaics=self.options.detect_face_mosaics)
+
+        if is_vulkan_device(self.options.device):
+            return build_vulkan_frame_restorer(
+                device=self.options.device,
+                video_file=self.options.video_metadata.video_file,
+                max_clip_length=self.options.max_clip_length,
+                mosaic_restoration_model_name=self.options.mosaic_restoration_model_name,
+                mosaic_detection_model=self.models_cache["mosaic_detection_model"],
+                mosaic_restoration_model=self.models_cache["mosaic_restoration_model"],
+                preferred_pad_mode=self.models_cache["mosaic_restoration_model_preferred_pad_mode"],
+                mosaic_detection=self.options.mosaic_detection,
+            )
 
         return FrameRestorer(self.options.device,
                              self.options.video_metadata.video_file,

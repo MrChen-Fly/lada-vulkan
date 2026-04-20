@@ -38,6 +38,8 @@ except ModuleNotFoundError:
 from lada import VERSION, ModelFiles
 from lada.cli import utils
 from lada.extensions import vulkan
+from lada.extensions.vulkan.frame_restorer import build_vulkan_frame_restorer
+from lada.extensions.vulkan.runtime import is_vulkan_device
 from lada.utils import audio_utils, video_utils
 from lada.utils.os_utils import gpu_has_fp16_acceleration, get_default_torch_device
 from lada.restorationpipeline.frame_restorer import FrameRestorer
@@ -114,8 +116,19 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                        mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start):
     video_metadata = get_video_meta_data(input_path)
 
-    frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
-                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
+    if is_vulkan_device(str(device)):
+        frame_restorer = build_vulkan_frame_restorer(
+            device=device,
+            video_file=input_path,
+            max_clip_length=max_clip_length,
+            mosaic_restoration_model_name=mosaic_restoration_model_name,
+            mosaic_detection_model=mosaic_detection_model,
+            mosaic_restoration_model=mosaic_restoration_model,
+            preferred_pad_mode=preferred_pad_mode,
+        )
+    else:
+        frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
+                     mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
     success = True
     video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)

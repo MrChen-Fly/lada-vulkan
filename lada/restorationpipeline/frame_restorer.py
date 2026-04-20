@@ -166,9 +166,12 @@ class FrameRestorer:
             assert isinstance(self.mosaic_restoration_model, DeepmosaicsMosaicRestorer)
             restored_clip_images = self.mosaic_restoration_model.restore(images)
         elif self.mosaic_restoration_model_name.startswith("basicvsrpp"):
-            from lada.restorationpipeline.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
-            assert isinstance(self.mosaic_restoration_model, BasicvsrppMosaicRestorer)
-            restored_clip_images = self.mosaic_restoration_model.restore(images)
+            restore_clip = getattr(self.mosaic_restoration_model, "restore", None)
+            if not callable(restore_clip):
+                raise TypeError(
+                    "BasicVSR++ restoration model must provide a callable 'restore' method."
+                )
+            restored_clip_images = restore_clip(images)
         else:
             raise NotImplementedError()
         return restored_clip_images
@@ -210,7 +213,9 @@ class FrameRestorer:
             clip_mask = image_utils.unpad_image(clip_mask, pad_after_resize)
             clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
             clip_mask = image_utils.resize(clip_mask, orig_crop_shape[:2],interpolation=cv2.INTER_NEAREST)
-            blend_mask = mask_utils.create_blend_mask(clip_mask.to(device=self.device).float()).to(device=clip_img.device, dtype=target_dtype)
+            blend_mask = mask_utils.create_blend_mask(
+                clip_mask.to(device=clip_img.device).float()
+            ).to(device=clip_img.device, dtype=target_dtype)
 
             blend(blend_mask, clip_img, orig_clip_box)
 

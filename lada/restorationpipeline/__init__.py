@@ -17,7 +17,7 @@ def load_models(
     fp16: bool,
     detect_face_mosaics: bool):
     if str(device).startswith("vulkan"):
-        from lada.extensions.iree.pipeline import load_vulkan_models
+        from lada.extensions.vulkan.pipeline import load_vulkan_models
 
         return load_vulkan_models(
             mosaic_restoration_model_name=mosaic_restoration_model_name,
