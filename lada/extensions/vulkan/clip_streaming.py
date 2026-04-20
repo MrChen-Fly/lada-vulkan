@@ -5,6 +5,15 @@ from collections.abc import Iterator
 from lada.restorationpipeline.mosaic_detector import Clip
 
 
+def _normalize_segment_length(length: int | None) -> int | None:
+    if length is None:
+        return None
+    normalized_length = int(length)
+    if normalized_length <= 0:
+        return None
+    return normalized_length
+
+
 def slice_processed_clip(
     clip: Clip,
     *,
@@ -44,18 +53,54 @@ def iter_processed_clip_segments(
     clip: Clip,
     *,
     segment_length: int | None,
+    head_segment_length: int | None = None,
 ) -> Iterator[Clip]:
-    """Yield one or more processed clip segments without re-cropping frames."""
-    if segment_length is None:
+    """Yield processed clip segments with an optional low-latency head chunk."""
+    normalized_head_segment_length = _normalize_segment_length(head_segment_length)
+    normalized_segment_length = _normalize_segment_length(segment_length)
+    clip_length = len(clip.frames)
+
+    if (
+        normalized_head_segment_length is not None
+        and clip_length > normalized_head_segment_length
+        and (
+            normalized_segment_length is None
+            or normalized_head_segment_length < normalized_segment_length
+        )
+    ):
+        yield slice_processed_clip(
+            clip,
+            start=0,
+            stop=normalized_head_segment_length,
+            clip_id=clip.id,
+        )
+        if normalized_segment_length is None:
+            yield slice_processed_clip(
+                clip,
+                start=normalized_head_segment_length,
+                stop=clip_length,
+                clip_id=clip.id,
+            )
+            return
+
+        for start in range(
+            normalized_head_segment_length,
+            clip_length,
+            normalized_segment_length,
+        ):
+            yield slice_processed_clip(
+                clip,
+                start=start,
+                stop=start + normalized_segment_length,
+                clip_id=clip.id,
+            )
+        return
+
+    if normalized_segment_length is None or clip_length <= normalized_segment_length:
         yield clip
         return
 
-    normalized_segment_length = int(segment_length)
-    if normalized_segment_length <= 0 or len(clip.frames) <= normalized_segment_length:
-        yield clip
-        return
-
-    for start in range(0, len(clip.frames), normalized_segment_length):
+    for start in range(0, clip_length, normalized_segment_length):
         yield slice_processed_clip(
             clip,
             start=start,

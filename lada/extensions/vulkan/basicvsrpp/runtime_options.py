@@ -7,12 +7,19 @@ from dataclasses import dataclass, replace
 class RestorationSchedulingOptions:
     """Describe how the restoration pipeline should batch and release work."""
 
+    stream_restore_head_chunk_size: int | None = None
     stream_restore_chunk_size: int | None = None
     detector_batch_size: int = 4
     detector_segment_length: int | None = None
 
     def normalized(self) -> "RestorationSchedulingOptions":
         """Return a copy with validated positive integer values."""
+        head_chunk_size = self.stream_restore_head_chunk_size
+        if head_chunk_size is not None:
+            head_chunk_size = int(head_chunk_size)
+            if head_chunk_size <= 0:
+                head_chunk_size = None
+
         chunk_size = self.stream_restore_chunk_size
         if chunk_size is not None:
             chunk_size = int(chunk_size)
@@ -29,6 +36,7 @@ class RestorationSchedulingOptions:
 
         return replace(
             self,
+            stream_restore_head_chunk_size=head_chunk_size,
             stream_restore_chunk_size=chunk_size,
             detector_batch_size=detector_batch_size,
             detector_segment_length=detector_segment_length,
@@ -52,6 +60,8 @@ class RestorationSchedulingOptions:
         preferred = options.stream_restore_chunk_size or self.resolve_detector_segment_length(
             max_clip_length=max_clip_length,
         )
+        if options.stream_restore_head_chunk_size is not None:
+            preferred = min(preferred, options.stream_restore_head_chunk_size)
         preferred = max(int(preferred), 8)
         if queue_maxsize <= 0:
             return preferred
@@ -87,6 +97,9 @@ def resolve_restoration_scheduling_options(
             return options.normalized()
 
     return RestorationSchedulingOptions(
+        stream_restore_head_chunk_size=getattr(
+            model, "stream_restore_head_chunk_size", None
+        ),
         stream_restore_chunk_size=getattr(model, "stream_restore_chunk_size", None),
         detector_batch_size=int(getattr(model, "detector_batch_size", 4)),
         detector_segment_length=getattr(model, "detector_segment_length", None),

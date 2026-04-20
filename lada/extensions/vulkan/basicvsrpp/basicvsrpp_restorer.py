@@ -48,6 +48,7 @@ from .runtime_options import (
 from .runtime_profiling import WallClockProfiler
 
 _STREAM_RESTORE_CHUNK_SIZE = 60
+_STREAM_RESTORE_HEAD_CHUNK_SIZE = 24
 _DEFAULT_RUNTIME_SHAPE = resolve_basicvsrpp_runtime_shape(_DEFAULT_RUNTIME_FRAME_SHAPE)
 
 
@@ -86,6 +87,7 @@ class NcnnVulkanBasicvsrppMosaicRestorer:
         self.vulkan_audit: dict[str, object] = {}
         self.runtime_features = RestorationRuntimeFeatures()
         self.runtime_scheduling = RestorationSchedulingOptions(
+            stream_restore_head_chunk_size=_STREAM_RESTORE_HEAD_CHUNK_SIZE,
             stream_restore_chunk_size=_STREAM_RESTORE_CHUNK_SIZE,
             # Keep the detector on the existing 4-frame batching path so
             # low-latency clip restore can improve first-frame latency

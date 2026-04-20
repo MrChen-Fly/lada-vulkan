@@ -33,6 +33,7 @@ def _build_processed_clip(*, frame_start: int, length: int):
 
 def test_vulkan_frame_restorer_splits_long_clips_by_runtime_chunk_size() -> None:
     restorer = VulkanFrameRestorer.__new__(VulkanFrameRestorer)
+    restorer.stream_restore_head_chunk_size = None
     restorer.stream_restore_chunk_size = 2
 
     clip = _build_processed_clip(frame_start=10, length=5)
@@ -44,6 +45,51 @@ def test_vulkan_frame_restorer_splits_long_clips_by_runtime_chunk_size() -> None
     assert [len(segment.frames) for segment in segments] == [2, 2, 1]
     assert segments[0].frames is not clip.frames
     assert segments[0].frames[0] is clip.frames[0]
+
+
+def test_vulkan_frame_restorer_uses_short_head_chunk_before_steady_segments() -> None:
+    restorer = VulkanFrameRestorer.__new__(VulkanFrameRestorer)
+    restorer.stream_restore_head_chunk_size = 2
+    restorer.stream_restore_chunk_size = 4
+
+    clip = _build_processed_clip(frame_start=10, length=10)
+
+    segments = list(restorer._iter_restore_work_units(clip))
+
+    assert [segment.frame_start for segment in segments] == [10, 12, 16]
+    assert [segment.frame_end for segment in segments] == [11, 15, 19]
+    assert [len(segment.frames) for segment in segments] == [2, 4, 4]
+    assert segments[1].frames[0] is clip.frames[2]
+
+
+def test_vulkan_frame_restorer_ignores_head_chunk_that_is_not_shorter() -> None:
+    restorer = VulkanFrameRestorer.__new__(VulkanFrameRestorer)
+    restorer.stream_restore_head_chunk_size = 4
+    restorer.stream_restore_chunk_size = 4
+
+    clip = _build_processed_clip(frame_start=10, length=9)
+
+    segments = list(restorer._iter_restore_work_units(clip))
+
+    assert [segment.frame_start for segment in segments] == [10, 14, 18]
+    assert [segment.frame_end for segment in segments] == [13, 17, 18]
+    assert [len(segment.frames) for segment in segments] == [4, 4, 1]
+
+
+def test_vulkan_frame_restorer_uses_head_chunk_only_for_first_eligible_clip() -> None:
+    restorer = VulkanFrameRestorer.__new__(VulkanFrameRestorer)
+    restorer.stream_restore_head_chunk_size = 2
+    restorer.stream_restore_chunk_size = 4
+    restorer._head_chunk_available = True
+
+    first_clip = _build_processed_clip(frame_start=10, length=10)
+    second_clip = _build_processed_clip(frame_start=30, length=10)
+
+    first_segments = list(restorer._iter_restore_work_units(first_clip))
+    second_segments = list(restorer._iter_restore_work_units(second_clip))
+
+    assert [len(segment.frames) for segment in first_segments] == [2, 4, 4]
+    assert [len(segment.frames) for segment in second_segments] == [4, 4, 2]
 
 
 def test_vulkan_frame_restorer_consumes_runtime_scheduling_options(monkeypatch) -> None:
@@ -86,6 +132,7 @@ def test_vulkan_frame_restorer_consumes_runtime_scheduling_options(monkeypatch) 
 
     runtime_model = SimpleNamespace(
         get_runtime_scheduling_options=lambda: RestorationSchedulingOptions(
+            stream_restore_head_chunk_size=24,
             stream_restore_chunk_size=60,
             detector_batch_size=1,
             detector_segment_length=90,
@@ -102,6 +149,7 @@ def test_vulkan_frame_restorer_consumes_runtime_scheduling_options(monkeypatch) 
         preferred_pad_mode="zero",
     )
 
+    assert restorer.stream_restore_head_chunk_size == 24
     assert restorer.stream_restore_chunk_size == 60
     assert restorer.detector_batch_size == 1
     assert restorer.detector_segment_length == 90

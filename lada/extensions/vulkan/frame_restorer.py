@@ -34,6 +34,10 @@ class VulkanFrameRestorer(FrameRestorer):
         self.runtime_scheduling = resolve_restoration_scheduling_options(
             mosaic_restoration_model
         )
+        self._head_chunk_available = True
+        self.stream_restore_head_chunk_size = (
+            self.runtime_scheduling.stream_restore_head_chunk_size
+        )
         self.stream_restore_chunk_size = self.runtime_scheduling.stream_restore_chunk_size
         self.detector_batch_size = self.runtime_scheduling.detector_batch_size
         self.detector_segment_length = (
@@ -56,6 +60,10 @@ class VulkanFrameRestorer(FrameRestorer):
             mosaic_detection,
         )
         self._rebuild_clip_queues_and_detector()
+
+    def start(self, start_ns=0):
+        self._head_chunk_available = True
+        super().start(start_ns=start_ns)
 
     def _rebuild_clip_queues_and_detector(self) -> None:
         detector_clip_length = max(int(self.detector_segment_length), 1)
@@ -103,10 +111,30 @@ class VulkanFrameRestorer(FrameRestorer):
             error_handler=self._on_worker_thread_error,
         )
 
+    def _should_use_head_chunk_for_clip(self, clip) -> bool:
+        if not getattr(self, "_head_chunk_available", True):
+            return False
+
+        head_chunk_size = self.stream_restore_head_chunk_size
+        if head_chunk_size is None:
+            return False
+
+        steady_chunk_size = self.stream_restore_chunk_size
+        if steady_chunk_size is not None and head_chunk_size >= steady_chunk_size:
+            return False
+
+        return len(clip.frames) > head_chunk_size
+
     def _iter_restore_work_units(self, clip):
+        head_segment_length = None
+        if self._should_use_head_chunk_for_clip(clip):
+            head_segment_length = self.stream_restore_head_chunk_size
+            self._head_chunk_available = False
+
         return iter_processed_clip_segments(
             clip,
             segment_length=self.stream_restore_chunk_size,
+            head_segment_length=head_segment_length,
         )
 
     def _clip_restoration_worker(self):
